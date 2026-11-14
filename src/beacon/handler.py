@@ -1,0 +1,662 @@
+from __future__ import annotations
+
+import logging
+import os
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import UTC, datetime
+
+os.environ.setdefault("TQDM_DISABLE", "1")  # noqa: E402
+
+from typing import Any  # noqa: E402
+
+from beacon import changes, channels, rca
+from beacon.analyzer import analyze_logs
+from beacon.budget import SourcePlan, compute_available_tokens, plan_token_budget
+from beacon.config import NightShiftConfig
+from beacon.events import TriggerInfo, TriggerType, parse_event
+from beacon.logs import fetch_logs, resolve_log_groups
+from beacon.notifier import notify
+from beacon.triage import build_trigger_context, get_system_prompt, last_usage, triage
+
+logger = logging.getLogger(__name__)
+
+
+def _fetch_all_logs(config: NightShiftConfig, trigger: TriggerInfo) -> dict[str, str]:
+    """Fetch log text for every configured log group.
+
+    For pushed-log triggers, the lines delivered in the event are used
+    directly instead of re-fetching from Loki.
+    """
+    log_groups = resolve_log_groups(config.log_group_patterns)
+    if not log_groups:
+        logger.warning("No log groups matched the configured patterns")
+        return {}
+
+    log_sources: dict[str, str] = {}
+    for log_group in log_groups:
+        if trigger.raw_logs and trigger.log_group == log_group:
+            log_sources[log_group] = trigger.raw_logs
+            continue
+        lookback = trigger.lookback_minutes or config.lookback_minutes
+        text = fetch_logs(log_group, lookback)
+        if text.strip():
+            log_sources[log_group] = text
+    return log_sources
+
+
+def _build_section_label(plan: SourcePlan) -> str:
+    """Build a human-readable header like ``[{app="api"}] (reduced to top 45%)``."""
+    if plan.needs_reduction and plan.anomaly_percentile is not None:
+        return f"[{plan.log_group}] (reduced to top {plan.anomaly_percentile:.0%})"
+    return f"[{plan.log_group}] (full logs)"
+
+
+def _process_sources(
+    plans: list[SourcePlan],
+    config: NightShiftConfig,
+    timeline: list[dict[str, Any]] | None = None,
+) -> str:
+    """Combine all source plans into a single labeled text block.
+
+    Sources that need reduction are passed through Cordon; others are
+    included as raw logs.  Each reduction is recorded on *timeline*.
+    """
+    sections: list[str] = []
+    for plan in plans:
+        label = _build_section_label(plan)
+        if plan.needs_reduction and plan.anomaly_percentile is not None:
+            reduced = analyze_logs(plan.log_text, plan.anomaly_percentile, config)
+            sections.append(f"{label}\n{reduced}")
+            logger.info(
+                "Cordon reduced %s to top %.0f%% (model %s)",
+                plan.log_group,
+                plan.anomaly_percentile * 100,
+                config.embedding_model_id,
+            )
+            if timeline is not None:
+                timeline.append(
+                    _event(
+                        "reduced",
+                        log_group=plan.log_group,
+                        percentile=round(plan.anomaly_percentile, 3),
+                        model=config.embedding_model_id,
+                    )
+                )
+        else:
+            sections.append(f"{label}\n{plan.log_text}")
+    return "\n\n".join(sections)
+
+
+def _event(name: str, **detail: Any) -> dict[str, Any]:
+    """Build one incident timeline entry with a UTC timestamp."""
+    entry: dict[str, Any] = {"t": datetime.now(tz=UTC).isoformat(), "event": name}
+    if detail:
+        entry["detail"] = detail
+    return entry
+
+
+def _configure_logging() -> None:
+    """Set up logging and suppress noisy third-party loggers."""
+    logging.basicConfig(level=logging.INFO)
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    for name in (
+        "sentence_transformers",
+        "transformers",
+        "LiteLLM",
+        "litellm",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _morning_report(event: dict[str, Any], config: NightShiftConfig) -> dict[str, Any]:
+    """The 07:00 schedule: summarise last night and send it to every channel."""
+    from beacon import contracts, reports, store
+
+    rows = store.scan_incidents(config.incidents_table_name)
+    rows.sort(key=lambda r: str(r.get("timestamp", "")), reverse=True)
+    live = contracts.list_active(
+        table_name=os.environ.get("CONTRACTS_TABLE_NAME", "contracts")
+    )
+    report = reports.morning_report(
+        rows, contracts=live, night_of=event.get("night_of")
+    )
+    logger.info(
+        "morning report sent for %s (%d incidents)",
+        report["night_of"],
+        report["incidents"],
+    )
+    channels.send("morning_report", report["subject"], report["text"])
+    return {
+        "mode": "morning_report",
+        **{k: v for k, v in report.items() if k != "text"},
+    }
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """Triage entry point: analyse evidence, notify, store the incident."""
+    _configure_logging()
+    config = NightShiftConfig.from_env()
+    if isinstance(event, dict) and event.get("mode") == "morning_report":
+        return _morning_report(event, config)
+    trigger = parse_event(event, config)
+    timeline: list[dict[str, Any]] = [
+        _event(
+            "alarm_received"
+            if trigger.trigger_type == TriggerType.ALARM
+            else "triggered",
+            trigger_type=trigger.trigger_type.value,
+            alarm_name=trigger.alarm_name,
+        )
+    ]
+
+    duplicate = _find_duplicate(trigger, config)
+    if duplicate:
+        logger.info("Open incident %s already exists for this alarm", duplicate)
+        return {
+            "statusCode": 200,
+            "body": f"Duplicate incident {duplicate}",
+            "incident_id": duplicate,
+        }
+
+    log_sources = _fetch_all_logs(config, trigger)
+    if not log_sources:
+        logger.info("No logs found for any configured log group")
+        return {"statusCode": 200, "body": "No logs found"}
+    timeline.append(
+        _event(
+            "logs_fetched",
+            groups=len(log_sources),
+            lines=sum(text.count("\n") + 1 for text in log_sources.values()),
+        )
+    )
+
+    system_prompt = get_system_prompt()
+    trigger_context = build_trigger_context(trigger)
+    available = compute_available_tokens(config, system_prompt, trigger_context)
+    plans = plan_token_budget(log_sources, available, config)
+
+    model_error: str | None = None
+    try:
+        combined_input = _process_sources(plans, config, timeline)
+    except Exception as exc:  # Cordon/embeddings unavailable: keep the raw logs
+        model_error = f"log reduction: {exc}"
+        logger.warning("model unavailable for log reduction: %s", exc)
+        combined_input = "\n\n".join(
+            f"{_build_section_label(plan)}\n{plan.log_text[-6000:]}" for plan in plans
+        )
+
+    # Deterministic sources come first: they outrank anything inferred from logs.
+    diagnostics = _run_diagnostics(config, timeline)
+    change_rows = _recent_changes(trigger, config, timeline, diagnostics)
+    prefix_sections = []
+    if diagnostics is not None:
+        prefix_sections.append(f"[diagnostics]\n{diagnostics['text']}")
+    if change_rows is not None:
+        alarm_at = _alarm_time(trigger)
+        prefix_sections.append(
+            f"[changes]\n{changes.format_changes(change_rows, alarm_at=alarm_at)}"
+        )
+    if prefix_sections:
+        combined_input = "\n\n".join([*prefix_sections, combined_input])
+
+    try:
+        analysis = triage(combined_input, trigger, config)
+    except Exception as exc:  # model unavailable: degrade, never drop the incident
+        model_error = f"triage: {exc}"
+        logger.warning("model unavailable for triage: %s", exc)
+        analysis = rca.fallback_analysis(
+            alarm_name=trigger.alarm_name,
+            diagnostics=diagnostics,
+            changes=change_rows,
+            log_text=combined_input,
+            reason=str(exc),
+        )
+    if model_error:
+        timeline.append(_event("model_unavailable", reason=model_error[:200]))
+    parsed = rca.parse(analysis)
+    _apply_deterministic_action(parsed, diagnostics)
+    timeline.append(
+        _event(
+            "rca_ready",
+            status=parsed.status,
+            model=config.llm_model_id,
+            suggested_action=parsed.suggested_action,
+        )
+    )
+
+    if _is_healthy(analysis) and trigger.trigger_type == TriggerType.SCHEDULE:
+        logger.info("Scheduled scan found no issues, skipping notification")
+        return {"statusCode": 200, "body": "Healthy, no notification sent"}
+
+    result: dict[str, Any] = {"statusCode": 200, "body": "Analysis complete"}
+    contract = _matching_contract(parsed, trigger, config, timeline)
+
+    if contract is not None:
+        # Handled while they sleep: no page, the loop runs, the morning email says so.
+        outcome = _remediate_under_contract(
+            analysis,
+            parsed,
+            trigger,
+            config,
+            timeline,
+            diagnostics,
+            change_rows,
+            contract,
+        )
+        result.update(outcome)
+        logger.info("Incident handled under Sleep Contract %s", contract["contract_id"])
+        return result
+
+    notify(analysis, trigger, config, link=_dashboard_link(config))
+    timeline.append(_event("notified"))
+
+    if config.incidents_enabled or config.call_enabled:
+        incident_id = _store_and_investigate(
+            analysis, parsed, trigger, config, timeline, diagnostics, change_rows
+        )
+        if incident_id:
+            result["incident_id"] = incident_id
+            # the page itself, where the on-call actually is (Slack/PagerDuty),
+            # with a deep link that opens straight onto this incident
+            channels.send(
+                "page",
+                f"Night Shift: {trigger.alarm_name or 'incident'} needs you",
+                parsed.summary or analysis[:400],
+                incident_id=incident_id,
+            )
+
+    logger.info("Analysis complete and notified")
+    return result
+
+
+def _find_duplicate(trigger: TriggerInfo, config: NightShiftConfig) -> str | None:
+    """Return the id of an open incident for the same alarm, if any.
+
+    Alarm re-evaluations and forced state changes must not create a second
+    incident (and a second page) for one outage.  Failures are logged and
+    treated as "no duplicate" so triage still runs.
+    """
+    if not (config.incidents_enabled and trigger.alarm_name):
+        return None
+    from beacon import store
+
+    try:
+        existing = store.find_open_incident(
+            trigger.alarm_name, table_name=config.incidents_table_name
+        )
+    except Exception:
+        logger.exception("Duplicate check failed; continuing with triage")
+        return None
+    return str(existing["incident_id"]) if existing else None
+
+
+def _store_and_investigate(
+    analysis: str,
+    parsed: rca.RcaJson,
+    trigger: TriggerInfo,
+    config: NightShiftConfig,
+    timeline: list[dict[str, Any]],
+    diagnostics: dict[str, Any] | None = None,
+    change_rows: list[dict[str, Any]] | None = None,
+) -> str | None:
+    """Store the incident, pre-fetch investigation data, optionally call.
+
+    The outbound call (Bolna, only when enabled) and the pre-fetch run in
+    parallel so cached data is ready before the engineer picks up.  Failures
+    are logged but never block the notification that was already sent.
+    """
+    from beacon import caller, prefetch, store
+
+    try:
+        incident_id = store.put_incident(
+            analysis,
+            trigger,
+            config,
+            rca_json=parsed.to_dict(),
+            timeline=timeline,
+            diagnostics=diagnostics,
+            changes=change_rows,
+        )
+        _store_usage(incident_id, config)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures: list[Future[Any]] = [
+                pool.submit(prefetch.run, incident_id, analysis, trigger, config)
+            ]
+            if config.call_enabled:
+                futures.append(
+                    pool.submit(caller.start_voice_call, incident_id, config)
+                )
+            for future in futures:
+                future.result()
+        return incident_id
+    except Exception:
+        logger.exception("Incident pipeline failed; the notification was still sent")
+        return None
+
+
+def _store_usage(incident_id: str, config: NightShiftConfig) -> None:
+    """Attach the triage model's token counts (for the ₹-per-incident tally)."""
+    if not last_usage:
+        return
+    from beacon import store
+
+    try:
+        store.add_usage(
+            incident_id, dict(last_usage), table_name=config.incidents_table_name
+        )
+    except Exception:
+        logger.exception("usage write failed")
+
+
+def _alarm_time(trigger: TriggerInfo) -> datetime:
+    """When the alarm changed state (falls back to now)."""
+    if trigger.alarm_time:
+        try:
+            return datetime.fromisoformat(trigger.alarm_time.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now(tz=UTC)
+
+
+def _dashboard_link(config: NightShiftConfig) -> str:
+    return config.dashboard_url
+
+
+def _run_diagnostics(
+    config: NightShiftConfig, timeline: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """NetworkPolicy drift and Deployment health; None when no snapshot exists."""
+    if not config.incidents_enabled:
+        return None
+    from beacon import diagnose
+    from beacon.remediation import actions_netpol
+
+    golden = actions_netpol.load_golden_snapshot() or {}
+    if not golden and not os.environ.get("REMEDIABLE_DEPLOYMENTS"):
+        timeline.append(_event("diagnostics_skipped", reason="nothing configured"))
+        return None
+    try:
+        result = diagnose.run(golden)
+    except Exception:
+        logger.exception("diagnostics failed")
+        timeline.append(_event("diagnostics_failed"))
+        return None
+    timeline.append(
+        _event(
+            "diagnostics_ran",
+            missing_rules=len(result["missing_rules"]),
+            suggested_action=result["suggested_action"],
+        )
+    )
+    return result
+
+
+def _affected_ids(diagnostics: dict[str, Any] | None) -> list[str]:
+    """Resource ids diagnostics found broken (NetworkPolicies, Deployments)."""
+    if not diagnostics:
+        return []
+    ids: list[str] = []
+    for rule in diagnostics.get("missing_rules") or []:
+        ids.append(f"{rule.get('namespace')}/{rule.get('name')}")
+    for dep in diagnostics.get("deployments") or []:
+        if not dep.get("healthy"):
+            ids.append(f"{dep.get('namespace')}/{dep.get('name')}")
+    return [i for i in ids if i]
+
+
+def _recent_changes(
+    trigger: TriggerInfo,
+    config: NightShiftConfig,
+    timeline: list[dict[str, Any]],
+    diagnostics: dict[str, Any] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Cluster and deployment changes before the alert, from the ledger."""
+    if not config.incidents_enabled:
+        return None
+    try:
+        rows = changes.recent(
+            60,
+            before=datetime.now(tz=UTC),
+            affected_ids=_affected_ids(diagnostics),
+        )
+    except Exception:
+        logger.exception("change lookup failed")
+        timeline.append(_event("changes_failed"))
+        return None
+    timeline.append(
+        _event(
+            "changes_checked",
+            count=len(rows),
+            top=rows[0].get("event_name") if rows else None,
+            source=rows[0].get("source") if rows else None,
+        )
+    )
+    return rows
+
+
+def _apply_deterministic_action(
+    parsed: rca.RcaJson, diagnostics: dict[str, Any] | None
+) -> None:
+    """Exact ids from diagnostics beat whatever the model guessed.
+
+    When diagnostics found nothing deterministic, the model's own proposal
+    survives only if it names an allowlisted action on a configured resource
+    (schema-valid params, Deployment in REMEDIABLE_DEPLOYMENTS, rule in the
+    golden snapshot); otherwise it is dropped, never executed.
+    """
+    from beacon.remediation import actions_deploy, actions_netpol, registry
+    from beacon.remediation.base import ParamError
+
+    if diagnostics and diagnostics.get("suggested_action"):
+        parsed.beacon_json["suggested_action"] = diagnostics["suggested_action"]
+        parsed.beacon_json["action_params"] = diagnostics["action_params"]
+        parsed.beacon_json["action_source"] = "diagnostics"
+        # why this action, and how sure the checks are — the agent reads it aloud
+        parsed.beacon_json["action_reason"] = diagnostics.get("action_reason")
+        parsed.beacon_json["action_confidence"] = diagnostics.get("action_confidence")
+        parsed.beacon_json.setdefault(
+            "fingerprint", diagnostics["suggested_action"].replace(".", "-")
+        )
+        return
+    action = parsed.beacon_json.get("suggested_action")
+    params = parsed.beacon_json.get("action_params")
+    if not action:
+        return
+    ok = False
+    try:
+        valid = registry.validate_params(
+            str(action), params if isinstance(params, dict) else {}
+        )
+        if str(action).startswith("deployment."):
+            ok = actions_deploy.is_configured(valid)
+        elif action == "networkpolicy.restore_ingress":
+            golden = actions_netpol.load_golden_snapshot() or {}
+            ok = actions_netpol.in_golden_snapshot(valid, golden)
+    except ParamError:
+        ok = False
+    if ok:
+        parsed.beacon_json["action_source"] = "model"
+    else:
+        logger.warning("model proposed %s on unconfigured resources; dropped", action)
+        parsed.beacon_json["suggested_action"] = None
+        parsed.beacon_json["action_params"] = None
+        parsed.beacon_json["action_source"] = "rejected"
+
+
+def _matching_contract(
+    parsed: rca.RcaJson,
+    trigger: TriggerInfo,
+    config: NightShiftConfig,
+    timeline: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """A live Sleep Contract covering this alarm + action + exact params, if allowed."""
+    if not (config.incidents_enabled and trigger.alarm_name):
+        return None
+    action = parsed.suggested_action
+    params = parsed.beacon_json.get("action_params")
+    if not action or not isinstance(params, dict):
+        return None
+    table = os.environ.get("CONTRACTS_TABLE_NAME", "contracts")
+    from beacon import contracts
+    from beacon.remediation import actions_netpol, registry
+
+    try:
+        registry.validate_params(action, params)
+        contract = contracts.match(trigger.alarm_name, action, params, table_name=table)
+    except Exception:
+        logger.exception("contract match failed")
+        return None
+    if contract is None:
+        return None
+    if action == "networkpolicy.restore_ingress":
+        golden = actions_netpol.load_golden_snapshot() or {}
+        if not actions_netpol.in_golden_snapshot(params, golden):
+            timeline.append(
+                _event("contract_ignored", reason="params not in golden snapshot")
+            )
+            return None
+    if not config.apply_enabled:
+        timeline.append(
+            _event(
+                "contract_matched_apply_disabled", contract_id=contract["contract_id"]
+            )
+        )
+        return None
+    return contract
+
+
+def _start_execution(payload: dict[str, Any]) -> str:
+    """Start the Temporal remediation loop; returns the workflow id."""
+    from beacon import workflows
+
+    return workflows.start_remediation(payload)
+
+
+def _remediate_under_contract(
+    analysis: str,
+    parsed: rca.RcaJson,
+    trigger: TriggerInfo,
+    config: NightShiftConfig,
+    timeline: list[dict[str, Any]],
+    diagnostics: dict[str, Any] | None,
+    change_rows: list[dict[str, Any]] | None,
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Consume one contract use, record the approval, start the loop, say so."""
+    from beacon import approvals, contracts, store
+
+    action = str(parsed.suggested_action)
+    params = dict(parsed.beacon_json["action_params"])
+    contracts_table = os.environ.get("CONTRACTS_TABLE_NAME", "contracts")
+    approvals_table = os.environ.get("APPROVALS_TABLE_NAME", "approvals")
+
+    if not contracts.use(contract["contract_id"], table_name=contracts_table):
+        timeline.append(
+            _event("contract_exhausted", contract_id=contract["contract_id"])
+        )
+        notify(analysis, trigger, config, link=_dashboard_link(config))
+        incident_id = _store_and_investigate(
+            analysis, parsed, trigger, config, timeline, diagnostics, change_rows
+        )
+        return {"incident_id": incident_id} if incident_id else {}
+
+    timeline.append(
+        _event(
+            "contract_matched",
+            contract_id=contract["contract_id"],
+            uses_left=int(contract.get("max_uses", 0))
+            - int(contract.get("uses", 0))
+            - 1,
+        )
+    )
+    incident_id = store.put_incident(
+        analysis,
+        trigger,
+        config,
+        rca_json=parsed.to_dict(),
+        timeline=timeline,
+        diagnostics=diagnostics,
+        changes=change_rows,
+        status="auto_remediating",
+        woken=False,
+    )
+    _store_usage(incident_id, config)
+    approval = approvals.create(
+        incident_id,
+        action,
+        params,
+        source="contract",
+        channel="contract",
+        transcript_quote=str(contract.get("transcript_quote", "")),
+        contract_id=str(contract["contract_id"]),
+        table_name=approvals_table,
+        attestation={
+            "evidence": "contract",
+            "contract_id": str(contract["contract_id"]),
+        },
+    )
+    payload = {
+        "approval_id": approval["approval_id"],
+        "incident_id": incident_id,
+        "action": action,
+        "params": params,
+    }
+    try:
+        execution_arn = _start_execution(payload)
+    except Exception:
+        logger.exception("could not start remediation loop; paging instead")
+        store.update_status(
+            incident_id,
+            "awaiting_engineer",
+            table_name=config.incidents_table_name,
+            extra={"woken": True},
+        )
+        notify(analysis, trigger, config, link=_dashboard_link(config))
+        return {"incident_id": incident_id}
+
+    latest = store.get_incident(incident_id, table_name=config.incidents_table_name)
+    status = str(latest.get("status") or "auto_remediating")
+    if status not in ("resolved", "escalated"):  # inline mode may already be done
+        status = "auto_remediating"
+    store.update_status(
+        incident_id,
+        status,
+        table_name=config.incidents_table_name,
+        extra={
+            "execution_arn": execution_arn,
+            "handled_by": "contract",
+            "contract_id": str(contract["contract_id"]),
+        },
+    )
+    store.append_timeline(
+        incident_id,
+        "remediation_started",
+        table_name=config.incidents_table_name,
+        detail={"execution_arn": execution_arn, "source": "contract"},
+    )
+    notify(
+        analysis,
+        trigger,
+        config,
+        link=_dashboard_link(config),
+        variant="contract",
+        contract=contract,
+    )
+    channels.send(
+        "contract",
+        f"Handled under your Sleep Contract: {trigger.alarm_name or 'incident'}",
+        f"You were not woken. Night Shift is applying {action} under contract "
+        f"{contract['contract_id']} and will verify recovery.",
+        incident_id=incident_id,
+    )
+    return {
+        "incident_id": incident_id,
+        "contract_id": contract["contract_id"],
+        "execution_arn": execution_arn,
+    }
+
+
+def _is_healthy(analysis: str) -> bool:
+    """Return True if the parsed RCA ``STATUS`` is ``Healthy``."""
+    return rca.is_healthy(analysis)

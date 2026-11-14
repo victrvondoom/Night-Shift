@@ -1,0 +1,69 @@
+# Two identities, one direction.
+#   beacon-api          what you talk to. Read-only in the remediable namespace.
+#   beacon-remediator   the worker. The only identity that may patch anything,
+#                       and only NetworkPolicies and Deployments in that namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: beacon-api, namespace: beacon}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: beacon-remediator, namespace: beacon}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: beacon-api-read, namespace: demo}
+rules:
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: beacon-api-read, namespace: demo}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: beacon-api-read}
+subjects: [{kind: ServiceAccount, name: beacon-api, namespace: beacon}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: beacon-remediator, namespace: demo}
+rules:
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: beacon-remediator, namespace: demo}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: beacon-remediator}
+subjects: [{kind: ServiceAccount, name: beacon-remediator, namespace: beacon}]
+---
+# The golden snapshot lives in a ConfigMap in Night Shift's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: beacon-golden, namespace: beacon}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: beacon-golden, namespace: beacon}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: beacon-golden}
+subjects: [{kind: ServiceAccount, name: beacon-remediator, namespace: beacon}]

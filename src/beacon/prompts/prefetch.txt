@@ -1,0 +1,24 @@
+Given the following incident analysis, identify the Prometheus queries,
+Loki log queries and Kubernetes object checks an on-call engineer would most
+likely run next.
+
+Return ONLY valid JSON with this schema:
+{
+  "metrics": [
+    {"query_key": "human-readable label",
+     "promql": "sum(rate(demo_db_errors_total[1m]))", "period_minutes": 60}
+  ],
+  "log_queries": [
+    {"query_key": "human-readable label", "selector": "{namespace=\"demo\"}",
+     "filter_pattern": "ERROR", "lookback_minutes": 60}
+  ],
+  "status_checks": [
+    {"query_key": "human-readable label", "kind": "deployment",
+     "namespace": "demo", "name": "demo-api"}
+  ]
+}
+
+status_checks are read-only and "kind" must be one of: deployment,
+networkpolicy, pods (for pods, "name" is the value of the app label).
+Use only selectors, namespaces and names that appear in the analysis or in
+the log selectors you were given. Limit to 10 total queries.

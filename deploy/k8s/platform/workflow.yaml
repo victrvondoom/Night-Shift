@@ -1,0 +1,96 @@
+# Temporal (durable workflows), Open Policy Agent (policy), Ollama (local model).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: temporal, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: temporal}}
+  template:
+    metadata: {labels: {app: temporal}}
+    spec:
+      containers:
+        - name: temporal
+          image: temporalio/auto-setup:1.25.2
+          env:
+            - {name: DB, value: postgres12}
+            - {name: DB_PORT, value: "5432"}
+            - {name: POSTGRES_SEEDS, value: postgres}
+            - {name: POSTGRES_USER, value: beacon}
+            - name: POSTGRES_PWD
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: POSTGRES_PASSWORD}}
+          ports: [{containerPort: 7233}]
+          readinessProbe:
+            tcpSocket: {port: 7233}
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata: {name: temporal, namespace: beacon}
+spec:
+  selector: {app: temporal}
+  ports: [{port: 7233}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: opa, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: opa}}
+  template:
+    metadata: {labels: {app: opa}}
+    spec:
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:1.0.0
+          args: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/remediation.rego"]
+          ports: [{containerPort: 8181}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8181}
+            periodSeconds: 3
+          volumeMounts: [{name: policy, mountPath: /policy}]
+      volumes:
+        - name: policy
+          configMap: {name: beacon-policy}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: opa, namespace: beacon}
+spec:
+  selector: {app: opa}
+  ports: [{port: 8181}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: ollama, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: ollama}}
+  template:
+    metadata: {labels: {app: ollama}}
+    spec:
+      containers:
+        - name: ollama
+          image: ollama/ollama:latest
+          envFrom: [{configMapRef: {name: beacon-proxy, optional: true}}]
+          ports: [{containerPort: 11434}]
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    until ollama list >/dev/null 2>&1; do sleep 1; done
+                    ollama pull "$CHAT_MODEL" || true; ollama pull "$EMBED_MODEL" || true
+          env:
+            - {name: CHAT_MODEL, value: "qwen2.5:1.5b"}
+            - {name: EMBED_MODEL, value: "nomic-embed-text"}
+          volumeMounts: [{name: models, mountPath: /root/.ollama}]
+      volumes: [{name: models, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: ollama, namespace: beacon}
+spec:
+  selector: {app: ollama}
+  ports: [{port: 11434}]

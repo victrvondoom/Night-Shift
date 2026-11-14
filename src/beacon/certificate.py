@@ -1,0 +1,328 @@
+"""The consent certificate: why one change to production was allowed to happen.
+
+A voice agent that can change infrastructure has a problem no chatbot has. Six weeks
+later somebody asks *who told it to do that* — an auditor, a postmortem, a customer,
+a regulator — and "the model decided to" is not an answer anybody accepts. The answer
+has to be an artifact: portable, dated, and checkable by a person who was not there
+and does not trust you.
+
+Every line of it is something Night Shift can show a record for:
+
+* **what was said** — the phrase, from the transcript, never from the model's argument
+* **how clearly** — per-word confidence, scored by the weakest word in the phrase
+* **through which channel** — and on a phone, which side of a two-channel recording
+* **who else was there** — on a phone call, whether a second voice was on the
+  caller's own channel when the phrase was said
+* **the recording itself** — so the words can be played back, not just read
+
+Around that sits the part code decides: the one allowlisted action, the parameters
+that passed a dry run, and the Prometheus and Kubernetes checks that had to agree before anything
+was called recovered.
+
+Nothing here computes anything new. It is an assembly of records that already exist,
+in one shape, so that a change can be justified without a tour of four systems.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any
+
+SCHEMA = "beacon.consent-certificate/1"
+
+
+def was_typed(approval: dict[str, Any]) -> bool:
+    """Whether these words were typed into the console rather than spoken."""
+    stt = str((approval.get("attestation") or {}).get("stt") or "")
+    return approval.get("channel") == "typed" or stt == "typed"
+
+
+def _confidence_of(
+    approval: dict[str, Any], attested: dict[str, Any]
+) -> dict[str, Any]:
+    """How clearly the phrase was heard, and where that number came from.
+
+    Typed consent has no audio and so no confidence. Bolna reports no per-word
+    confidence to Night Shift for a live call, so none is shown: a number here would
+    have to be invented. The field stays so a channel that does measure one can
+    report it, and says plainly when nothing was measured.
+    """
+    if was_typed(approval):
+        return {
+            "value": None,
+            "weakest_word": None,
+            "measured": "not measured",
+            "gated_the_change": False,
+            "typed": True,
+            "note": (
+                "these words were typed into the console, not spoken; "
+                "there is no audio to score"
+            ),
+        }
+    attestation = attest_of(approval, attested)
+    if attestation is not None:
+        return {
+            "value": attestation.get("confidence"),
+            "weakest_word": attestation.get("weakest_word"),
+            "measured": "after the fact, from the session recording",
+            "gated_the_change": False,
+        }
+    live = (approval.get("attestation") or {}).get("confidence")
+    if isinstance(live, int | float):
+        return {
+            "value": round(float(live), 4),
+            "weakest_word": None,
+            "measured": "at the time, before the change was applied",
+            "gated_the_change": True,
+        }
+    return {
+        "value": None,
+        "weakest_word": None,
+        "measured": "not measured",
+        "gated_the_change": False,
+        "note": "no speech confidence was reported for these words",
+    }
+
+
+def attest_of(
+    approval: dict[str, Any], attested: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The after-the-fact check for this approval's phrase, if one was run."""
+    phrase = str(approval.get("transcript_quote") or "").strip().lower()
+    for verdict in (attested or {}).values():
+        for check in verdict.get("checks") or []:
+            if str(check.get("phrase") or "").strip().lower() == phrase:
+                return dict(check)
+    return None
+
+
+def _one_voice_of(
+    approval: dict[str, Any], attested: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Whether the caller was alone, when the recording can answer that.
+
+    Only a two-channel phone recording can: the browser mixes the engineer and the
+    agent into one channel, so a second person in that room is not separable and the
+    certificate says nothing rather than guessing.
+    """
+    check = attest_of(approval, attested)
+    found = (check or {}).get("one_voice")
+    if not isinstance(found, dict) or found.get("ok") is None:
+        return None
+    return {
+        "alone": bool(found.get("ok")),
+        "voices": list(found.get("voices") or []),
+        "window_ms": found.get("window_ms"),
+    }
+
+
+def build(
+    incident: dict[str, Any],
+    approval: dict[str, Any],
+    *,
+    recording_url: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the certificate for one approval on one incident."""
+    attestation = approval.get("attestation") or {}
+    voice_request = attestation.get("voice_request") or {}
+    execution = approval.get("execute_result") or {}
+    attested = incident.get("voice_attestation") or {}
+    empty: dict[str, Any] = {}
+    proposal: dict[str, Any] = next(
+        (
+            p
+            for p in reversed(incident.get("proposals") or [])
+            if p.get("fix_id") == approval.get("fix_id")
+        ),
+        empty,
+    )
+    # Verification lives in the timeline as `verify_attempt`; some callers also
+    # carry a rolled-up `verification.last`. Reading only the latter meant a real
+    # incident produced a certificate with no checks on it at all — the field that
+    # says the checks agreed, silently empty.
+    last: dict[str, Any] = (incident.get("verification") or {}).get("last") or {}
+    if not last:
+        attempts = [
+            dict(e.get("detail") or {})
+            for e in incident.get("timeline") or []
+            if isinstance(e, dict) and e.get("event") == "verify_attempt"
+        ]
+        last = attempts[-1] if attempts else {}
+    checks = last.get("checks") or []
+    change = (incident.get("changes") or [{}])[0]
+
+    body: dict[str, Any] = {
+        "schema": SCHEMA,
+        "incident_id": incident.get("incident_id"),
+        "alarm": incident.get("alarm_name"),
+        "consent": {
+            "phrase": approval.get("transcript_quote"),
+            "channel": approval.get("channel"),
+            "spoken_at": str(approval.get("granted_at") or "")[:19],
+            "transcriber": attestation.get("stt"),
+            "session_id": attestation.get("session_id"),
+            # how Night Shift knows a person said this: typed_console, typed_telegram
+            # or contract. A Bolna function call alone is never listed here.
+            "provenance": attestation.get("evidence"),
+            # the voice request that preceded a typed confirmation, if any
+            "voice_request": (
+                {
+                    k: voice_request.get(k)
+                    for k in (
+                        "channel",
+                        "session_id",
+                        "execution_id",
+                        "requested_at",
+                        "provenance",
+                    )
+                }
+                if voice_request
+                else None
+            ),
+            "confidence": _confidence_of(approval, attested),
+            "one_voice": _one_voice_of(approval, attested),
+        },
+        "change": {
+            "action": approval.get("action") or proposal.get("action"),
+            "params": approval.get("params") or proposal.get("params") or {},
+            "proposal_id": (
+                f"proposal#{incident.get('incident_id')}#{approval.get('fix_id')}"
+                if approval.get("fix_id") is not None
+                else None
+            ),
+            "blast_radius": proposal.get("blast_radius"),
+            "dry_run": (proposal.get("dry_run") or {}).get("code"),
+            "dry_run_detail": (proposal.get("dry_run") or {}).get("detail"),
+            "executed_by": (proposal.get("dry_run") or {}).get("role"),
+            "execution": (
+                {
+                    "ok": execution.get("ok"),
+                    "code": execution.get("code"),
+                    "detail": execution.get("detail"),
+                    "executed_at": execution.get("executed_at"),
+                }
+                if execution
+                else None
+            ),
+        },
+        "caused_by": (
+            {
+                "event": change.get("event_name"),
+                "actor": change.get("actor_short"),
+                "at": change.get("event_time"),
+                "resources": change.get("resource_ids") or [],
+            }
+            if change
+            else None
+        ),
+        "verification": {
+            "attempt": last.get("attempt"),
+            "passed": sum(1 for c in checks if c.get("ok")),
+            "of": len(checks),
+            "checks": [
+                {
+                    "name": c.get("name"),
+                    "ok": bool(c.get("ok")),
+                    "detail": c.get("detail"),
+                }
+                for c in checks
+            ],
+            "resolved_at": incident.get("resolved_at"),
+        },
+        "proof": {
+            "recording": recording_url,
+            "approval_id": approval.get("approval_id"),
+            # the Bolna execution that holds the call's transcript and recording
+            "voice_execution_id": voice_request.get("execution_id"),
+        },
+    }
+    body["certificate_id"] = _fingerprint(body)
+    return body
+
+
+def _fingerprint(body: dict[str, Any]) -> str:
+    """A short digest of the certificate's contents.
+
+    Not a signature and not claimed to be one: it detects a certificate that has been
+    edited since it was issued, which is all it is for. Signing would need a key
+    nobody has agreed to manage yet, and a fake signature is worse than none.
+    """
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def to_markdown(cert: dict[str, Any]) -> str:
+    """The certificate as it appears in a pull request body."""
+    consent = cert["consent"]
+    conf = consent["confidence"]
+    change = cert["change"]
+    verification = cert["verification"]
+
+    typed = bool(conf.get("typed"))
+    verb = "Typed" if typed else "Said"
+    if typed:
+        heard = "typed, not spoken — there is no audio to score"
+    elif conf.get("value") is None:
+        heard = "confidence not measured"
+    else:
+        pct = f"{float(conf['value']):.0%}"
+        when = (
+            "checked before the change"
+            if conf["gated_the_change"]
+            else "checked afterwards"
+        )
+        weakest = (
+            f", weakest word “{conf['weakest_word']}”"
+            if conf.get("weakest_word")
+            else ""
+        )
+        heard = f"heard at **{pct}** ({when}{weakest})"
+
+    # A typed line has no channel worth naming and no transcriber at all, and
+    # "Typed via `typed`, transcribed by `typed`, typed, not spoken" is what
+    # filling the spoken template produced.
+    said = (
+        f"- **Typed** into the console at {consent['spoken_at']}Z — not spoken, "
+        "so there is no audio to score."
+        if typed
+        else (
+            f"- **{verb}** via `{consent['channel']}` at {consent['spoken_at']}Z, "
+            f"transcribed by `{consent['transcriber']}`, {heard}."
+        )
+    )
+    lines = [
+        "### Consent certificate",
+        "",
+        f"> “{consent['phrase']}”",
+        "",
+        said,
+        f"- **Authorised** `{change['action']}` with "
+        f"`{json.dumps(change['params'], sort_keys=True)}` — dry run "
+        f"`{change['dry_run']}` before anything ran.",
+    ]
+    if change.get("blast_radius"):
+        lines.append(f"- **Blast radius** {change['blast_radius']}")
+    alone = consent.get("one_voice")
+    if alone is not None:
+        lines.append(
+            "- **One voice** the caller was alone on their channel when they said it."
+            if alone["alone"]
+            else f"- **⚠ {len(alone['voices'])} voices** were on the caller's channel "
+            f"({', '.join(alone['voices'])}); somebody else was in the room."
+        )
+    if verification.get("of"):
+        lines.append(
+            f"- **Verified** {verification['passed']}/{verification['of']} checks on "
+            f"attempt {verification['attempt']}; Prometheus, the Kubernetes API and the health check had to agree before this "
+            "was called recovered."
+        )
+    if cert.get("caused_by") and cert["caused_by"].get("event"):
+        c = cert["caused_by"]
+        lines.append(f"- **Caused by** `{c['event']}` by `{c['actor']}` at {c['at']}.")
+    if cert["proof"].get("recording"):
+        lines.append(
+            f"- **Recording** [play the words back]({cert['proof']['recording']})"
+        )
+    lines += ["", f"`{cert['certificate_id']}`"]
+    return "\n".join(lines)

@@ -1,0 +1,1271 @@
+"""The seven tools the voice agent can call, and their JSON schemas.
+
+``TOOL_SCHEMAS`` is the contract shared by every voice backend (the Bolna voice agent, the local
+litellm/Ollama loop for typed turns
+later).  The functions are plain Python so any backend can dispatch to them.
+
+Safety rules enforced here, not in the model:
+
+* ``propose_fix`` only proposes the allowlisted action the incident's
+  diagnostics/RCA named, dry-run under the remediator role.
+* ``approve_fix`` executes only if the *raw transcript of this turn*
+  contains the exact confirmation phrase, the passcode was presented, and
+  ``APPLY_ENABLED`` is true.
+* ``grant_sleep_contract`` needs a read-back turn first, then an explicit
+  grant phrase (English or Hinglish); loose affirmatives never grant.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from typing import TYPE_CHECKING, Any
+
+from beacon import (
+    approvals,
+    channels,
+    consent_phrase,
+    contracts,
+    observability,
+    store,
+)
+from beacon.remediation import registry
+from beacon.remediation.base import ParamError
+from beacon.turn_context import TurnContext, current
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
+
+_GRANT_PATTERNS = (
+    re.compile(r"\bgrant (?:the )?contract for \d+ days?\b"),
+    re.compile(r"\bgrant (?:the )?contract\b"),
+    re.compile(r"\bcontract (?:do|de do|dedo|grant karo)\b"),
+    re.compile(r"\bcontract (?:grant|de) (?:kar|kar do|karo)\b"),
+)
+
+
+def _quote(ctx: TurnContext) -> str:
+    """What goes on the record.
+
+    Consent is checked against the words as heard, in memory. What is *written* —
+    the approval row, the audit, the postmortem, the pull request body — is the
+    redacted version when the channel produced one.
+    """
+    return str(ctx.attestation.get("redacted_quote") or ctx.transcript).strip()
+
+
+def _incidents_table() -> str:
+    return os.environ.get("INCIDENTS_TABLE_NAME", "incidents")
+
+
+def _approvals_table() -> str:
+    return os.environ.get("APPROVALS_TABLE_NAME", "approvals")
+
+
+def _contracts_table() -> str:
+    return os.environ.get("CONTRACTS_TABLE_NAME", "contracts")
+
+
+def _apply_enabled() -> bool:
+    return os.environ.get("APPLY_ENABLED", "true").lower() != "false"
+
+
+def _normalise(text: str) -> str:
+    """Shared with the two-channel audit; see beacon.consent_phrase."""
+    return consent_phrase.normalise(text)
+
+
+def _incident() -> dict[str, Any]:
+    ctx = current()
+    incident = store.get_incident(ctx.incident_id, table_name=_incidents_table())
+    if not incident:
+        raise LookupError(f"incident {ctx.incident_id} not found")
+    return incident
+
+
+def _rca(incident: dict[str, Any]) -> dict[str, Any]:
+    rca = incident.get("rca_json") or {}
+    return rca if isinstance(rca, dict) else {}
+
+
+@observability.span("remediate.dryrun")
+def _invoke_remediate(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one remediation step on the worker (the only identity with write RBAC).
+
+    The API process never patches the cluster: even a server-side dry run is
+    sent to the worker through Temporal and the result comes back here.
+    """
+    from beacon import workflows
+
+    try:
+        return workflows.run_step(str(payload.get("step")), payload)
+    except Exception as exc:
+        logger.exception("remediation step failed")
+        return {"ok": False, "error": f"remediation worker unavailable: {exc}"}
+
+
+def _start_execution(payload: dict[str, Any]) -> str:
+    from beacon import workflows
+
+    return workflows.start_remediation(payload)
+
+
+# Evidence kinds that prove a person, not a model, authorised a change. A Bolna
+# custom-function call carries only what the agent's LLM put in its arguments:
+# no caller transcript, no speaker attribution, no confidence. That is a
+# request for consent, never consent.
+VERIFIED_EVIDENCE = frozenset({"typed_console", "typed_telegram"})
+CONSENT_TOOLS = frozenset(
+    {"approve_fix", "undo_fix", "grant_sleep_contract", "open_fix_pr"}
+)
+
+
+def consent_verified(ctx: TurnContext) -> bool:
+    return ctx.attestation.get("evidence") in VERIFIED_EVIDENCE
+
+
+def _hold_if_unverified(
+    tool: str, args: dict[str, Any], refusal: dict[str, Any], phrase: str
+) -> dict[str, Any] | None:
+    """Fail closed when the words cannot be shown to be the engineer's own.
+
+    Called immediately before every consent side effect. On a verified channel
+    it returns None (and links any earlier voice request to this approval). On
+    an unverified one it records the request, leaves the proposal pending, and
+    tells the agent how the engineer can confirm.
+    """
+    ctx = current()
+    incident = _incident()
+    pending = [
+        p for p in (incident.get("pending_confirmations") or []) if isinstance(p, dict)
+    ]
+    if consent_verified(ctx):
+        earlier = next((p for p in pending if p.get("tool") == tool), None)
+        if earlier:
+            ctx.attestation["voice_request"] = earlier
+        return None
+    request = {
+        "tool": tool,
+        "args": args,
+        "phrase": phrase,
+        "channel": ctx.channel,
+        "session_id": ctx.session_id,
+        "execution_id": ctx.attestation.get("execution_id"),
+        "provenance": ctx.attestation.get("evidence") or "unverified",
+        "requested_at": _now_iso(),
+    }
+    store.update_status(
+        incident["incident_id"],
+        str(incident.get("status") or "awaiting_engineer"),
+        table_name=_incidents_table(),
+        extra={
+            "pending_confirmations": [
+                *(p for p in pending if p.get("tool") != tool),
+                request,
+            ]
+        },
+    )
+    store.append_timeline(
+        incident["incident_id"],
+        "consent_requested",
+        table_name=_incidents_table(),
+        detail={k: request[k] for k in ("tool", "args", "channel", "provenance")},
+    )
+    _tool_event(tool, args, f"held: needs typed confirmation '{phrase}'")
+    return {
+        **refusal,
+        "pending_confirmation": True,
+        "confirm_with": phrase,
+        "error": (
+            "nothing has been changed. A voice request cannot authorise this on "
+            f"its own: type '{phrase}' in the Night Shift console to confirm"
+        ),
+        "instruction": (
+            "Tell the engineer that nothing has changed yet, and that to authorise "
+            f"it they must type exactly '{phrase}' in the Night Shift console. Do not "
+            "say it was approved."
+        ),
+    }
+
+
+def clear_pending(
+    incident_id: str, tool: str | None = None, fix_id: Any = None
+) -> None:
+    """Drop pending voice requests (after confirmation, or on cancellation)."""
+    incident = store.get_incident(incident_id, table_name=_incidents_table())
+    pending = incident.get("pending_confirmations") or []
+    keep = [
+        p
+        for p in pending
+        if not (
+            (tool is None or p.get("tool") == tool)
+            and (fix_id is None or (p.get("args") or {}).get("fix_id") == fix_id)
+        )
+    ]
+    if len(keep) != len(pending):
+        db_status = str(incident.get("status") or "awaiting_engineer")
+        store.update_status(
+            incident_id,
+            db_status,
+            table_name=_incidents_table(),
+            extra={"pending_confirmations": keep},
+        )
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(tz=UTC).isoformat()
+
+
+def _tool_event(
+    name: str, args: dict[str, Any], summary: str, evidence_id: str | None = None
+) -> None:
+    current().tool_events.append(
+        {"name": name, "args": args, "summary": summary, "evidence_id": evidence_id}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+
+@observability.span("tool:get_incident_brief")
+def get_incident_brief() -> dict[str, Any]:
+    """The incident in one call: status, summary, spoken summary, cause, fix."""
+    incident = _incident()
+    rca = _rca(incident)
+    beacon_json = rca.get("beacon_json") or {}
+    card = current().add_evidence(
+        "rca",
+        f"RCA ({rca.get('status', '?')})",
+        {
+            "summary": rca.get("summary"),
+            "evidence": rca.get("evidence", []),
+            "next_steps": rca.get("next_steps", []),
+        },
+    )
+    handled_by = incident.get("handled_by")
+    spoken = str(rca.get("spoken_summary", ""))
+    if handled_by == "contract" and incident.get("status") == "resolved":
+        # The second alarm of the night: lead with the outcome, not the fault.
+        spoken = (
+            "This one was handled under your Sleep Contract; you were not woken. "
+            + spoken
+        )
+    out = {
+        "incident_id": incident["incident_id"],
+        "alarm_name": incident.get("alarm_name"),
+        "status": rca.get("status", "Unknown"),
+        "incident_status": incident.get("status"),
+        "handled_by": handled_by,
+        "woken": incident.get("woken"),
+        "contract_id": incident.get("contract_id"),
+        "summary": rca.get("summary", ""),
+        "spoken_summary": spoken,
+        "affected_components": rca.get("affected_components", []),
+        "change_correlation": rca.get("change_correlation"),
+        "suggested_action": beacon_json.get("suggested_action"),
+        "evidence": [card],
+    }
+    _tool_event("get_incident_brief", {}, f"briefed on {out['alarm_name']}", card["id"])
+    return out
+
+
+@observability.span("tool:get_evidence")
+def get_evidence(kind: str) -> dict[str, Any]:
+    """Evidence of one kind: logs, metrics, changes, diagnostics, or rca."""
+    incident = _incident()
+    rca = _rca(incident)
+    cached = incident.get("cached_data") or {}
+    if isinstance(cached, str):
+        try:
+            cached = json.loads(cached)
+        except json.JSONDecodeError:
+            cached = {}
+    kind = kind.strip().lower()
+    if kind == "logs":
+        payload: Any = {
+            "rca_evidence": rca.get("evidence", []),
+            "log_queries": cached.get("logs", []),
+        }
+        title = "Log evidence"
+    elif kind == "metrics":
+        payload = cached.get("metrics", [])
+        title = "Metrics"
+    elif kind == "changes":
+        payload = incident.get("changes") or []
+        title = "Recent changes (Kubernetes audit + GitHub)"
+    elif kind == "diagnostics":
+        payload = incident.get("diagnostics") or {}
+        title = "NetworkPolicy drift and Deployment health"
+    elif kind == "rca":
+        payload = {
+            k: rca.get(k)
+            for k in ("summary", "evidence", "next_steps", "change_correlation")
+        }
+        title = "RCA"
+    else:
+        return {
+            "error": (
+                f"unknown evidence kind '{kind}'; "
+                "use logs, metrics, changes, diagnostics or rca"
+            )
+        }
+    card = current().add_evidence(kind, title, payload)
+    _tool_event("get_evidence", {"kind": kind}, f"{title}: {card['id']}", card["id"])
+    return {"kind": kind, "evidence": [card], "data": payload}
+
+
+@observability.span("tool:propose_fix")
+def propose_fix() -> dict[str, Any]:
+    """Propose the one allowlisted fix, dry-run under the remediator role."""
+    incident = _incident()
+    beacon_json = _rca(incident).get("beacon_json") or {}
+    action = beacon_json.get("suggested_action")
+    params = beacon_json.get("action_params")
+    if not action or not isinstance(params, dict):
+        _tool_event("propose_fix", {}, "no safe fix known")
+        return {"error": "no safe fix known for this incident; investigate manually"}
+    try:
+        params = registry.validate_params(str(action), params)
+    except ParamError as exc:
+        return {"error": f"no safe fix: {exc}"}
+
+    existing = [p for p in (incident.get("proposals") or []) if isinstance(p, dict)]
+    fix_id = len(existing) + 1
+    result = _invoke_remediate(
+        {
+            "step": "dryrun",
+            "action": action,
+            "params": params,
+            "incident_id": incident["incident_id"],
+        }
+    )
+    spec = registry.get_action(str(action))
+    blast = str(
+        result.get("blast_radius") or (spec.blast_radius(params) if spec else "")
+    )
+    dry_run = {
+        "ok": bool(result.get("ok")),
+        "code": result.get("code"),
+        "detail": result.get("detail") or result.get("error"),
+        "role": result.get("role", ""),
+    }
+    proposal = approvals.create_proposal(
+        incident["incident_id"],
+        fix_id,
+        str(action),
+        params,
+        blast_radius=blast,
+        dry_run=dry_run,
+        table_name=_approvals_table(),
+    )
+    confidence = beacon_json.get("action_confidence")
+    summary = {
+        "fix_id": fix_id,
+        "action": action,
+        "params": params,
+        "blast_radius": blast,
+        "blast_radius_spoken": spoken_blast_radius(str(action), params),
+        # why this action was chosen, and how much the checks actually know. A
+        # "last_resort" restart is a remedy, not a diagnosis, and must be offered
+        # as one — the engineer is the one deciding on incomplete information.
+        "reason": beacon_json.get("action_reason"),
+        "confidence": confidence,
+        "is_last_resort": confidence == "last_resort",
+        "dry_run": dry_run,
+        "expires_at": proposal["expires_at"],
+    }
+    store.update_status(
+        incident["incident_id"],
+        str(incident.get("status") or "awaiting_engineer"),
+        table_name=_incidents_table(),
+        extra={"proposals": [*existing, summary]},
+    )
+    store.append_timeline(
+        incident["incident_id"],
+        "fix_proposed",
+        table_name=_incidents_table(),
+        detail={
+            "fix_id": fix_id,
+            "action": action,
+            "dry_run": dry_run,
+            "blast_radius": blast,
+            "blast_radius_spoken": spoken_blast_radius(str(action), params),
+        },
+    )
+    card = current().add_evidence("dry_run", f"Dry run of fix {fix_id}", dry_run)
+    _tool_event(
+        "propose_fix",
+        {},
+        f"fix {fix_id}: {action} (dry run {'PASSED' if dry_run['ok'] else 'FAILED'})",
+        card["id"],
+    )
+    return {
+        **summary,
+        "confirmation_phrase": registry.confirmation_phrase(fix_id),
+        "evidence": [card],
+        "instruction": (
+            (
+                "Say plainly that nothing explains the alarm and this is a restart "
+                "rather than a fix, give the reason, then the blast_radius_spoken, "
+                f"then ask for exactly '{registry.confirmation_phrase(fix_id)}'."
+                if confidence == "last_resort"
+                else f"Read back blast_radius_spoken and ask the engineer to say "
+                f"exactly '{registry.confirmation_phrase(fix_id)}' to approve."
+            )
+            if dry_run["ok"]
+            else "The dry run failed; do not offer to apply this fix."
+        ),
+    }
+
+
+@observability.span("tool:approve_fix")
+def approve_fix(fix_id: int, confirmation_phrase: str) -> dict[str, Any]:
+    """Execute proposal *fix_id* if the engineer really said the phrase."""
+    ctx = current()
+    phrase = registry.confirmation_phrase(int(fix_id))
+    spoken = _normalise(ctx.transcript)
+    refusal: dict[str, Any] = {"approved": False, "fix_id": int(fix_id)}
+    if not ctx.passcode_ok:
+        _tool_event("approve_fix", {"fix_id": fix_id}, "refused: no passcode")
+        return {**refusal, "error": "the session is not authorised (passcode missing)"}
+    if not _apply_enabled():
+        _tool_event("approve_fix", {"fix_id": fix_id}, "refused: apply disabled")
+        return {**refusal, "error": "remediation is disabled (APPLY_ENABLED=false)"}
+    if phrase not in spoken:
+        _tool_event(
+            "approve_fix", {"fix_id": fix_id}, "refused: phrase not in transcript"
+        )
+        return {**refusal, "error": f"I need you to say exactly '{phrase}' to approve"}
+
+    incident = _incident()
+    proposal = approvals.get_proposal(
+        incident["incident_id"], int(fix_id), table_name=_approvals_table()
+    )
+    if proposal is None:
+        raw = approvals.get_proposal_raw(
+            incident["incident_id"], int(fix_id), table_name=_approvals_table()
+        )
+        why = (
+            "was withdrawn because you interrupted the read-back"
+            if raw and raw.get("withdrawn_reason")
+            else "expired or was never proposed"
+        )
+        return {
+            **refusal,
+            "error": (
+                f"fix {fix_id} {why}; nothing was applied. Say 'fix it' and I will "
+                "propose it again with a fresh number"
+            ),
+        }
+    if not (proposal.get("dry_run") or {}).get("ok"):
+        return {**refusal, "error": "that fix failed its dry run; it cannot be applied"}
+    held = _hold_if_unverified("approve_fix", {"fix_id": int(fix_id)}, refusal, phrase)
+    if held:
+        return held
+    if not approvals.consume_proposal(
+        incident["incident_id"], int(fix_id), table_name=_approvals_table()
+    ):
+        _tool_event("approve_fix", {"fix_id": fix_id}, "refused: already approved")
+        return {
+            **refusal,
+            "error": f"fix {fix_id} was already approved once; nothing more was applied",
+        }
+
+    record = approvals.create(
+        incident["incident_id"],
+        str(proposal["action"]),
+        dict(proposal["params"]),
+        source="voice",
+        channel=ctx.channel,
+        transcript_quote=_quote(ctx),
+        fix_id=int(fix_id),
+        table_name=_approvals_table(),
+        attestation=ctx.attestation,
+    )
+    payload = {
+        "approval_id": record["approval_id"],
+        "incident_id": incident["incident_id"],
+        "action": proposal["action"],
+        "params": proposal["params"],
+    }
+    store.append_timeline(
+        incident["incident_id"],
+        "approved",
+        table_name=_incidents_table(),
+        detail={
+            "fix_id": int(fix_id),
+            "channel": ctx.channel,
+            "transcript_quote": ctx.transcript.strip(),
+            "approval_id": record["approval_id"],
+        },
+    )
+    try:
+        execution_arn = _start_execution(payload)
+    except Exception as exc:
+        logger.exception("start_execution failed")
+        return {**refusal, "error": f"could not start the remediation loop: {exc}"}
+    latest = store.get_incident(incident["incident_id"], table_name=_incidents_table())
+    if latest.get("status") in ("resolved", "escalated"):
+        # the loop ran inline (local / REMEDIATION_MODE=inline) and already finished
+        extra: dict[str, Any] = {"execution_arn": execution_arn, "handled_by": "voice"}
+        store.update_status(
+            incident["incident_id"],
+            str(latest["status"]),
+            table_name=_incidents_table(),
+            extra=extra,
+        )
+    else:
+        store.update_status(
+            incident["incident_id"],
+            "remediating",
+            table_name=_incidents_table(),
+            extra={
+                "execution_arn": execution_arn,
+                "handled_by": "voice",
+                "execute_requested_at": record["granted_at"],
+            },
+        )
+    _tool_event(
+        "approve_fix",
+        {"fix_id": fix_id},
+        f'approved via {ctx.channel}: "{ctx.transcript.strip()}"',
+    )
+    return {
+        "approved": True,
+        "fix_id": int(fix_id),
+        "approval_id": record["approval_id"],
+        "execution_arn": execution_arn,
+        "transcript_quote": ctx.transcript.strip(),
+        "instruction": (
+            "Tell the engineer the fix is being applied and verified; "
+            "you will report when the alarm clears."
+        ),
+    }
+
+
+def _read_back(
+    incident: dict[str, Any],
+    action: str,
+    params: dict[str, Any],
+    days: int,
+    max_uses: int,
+) -> str:
+    scope = ", ".join(f"{k} {v}" for k, v in params.items())
+    day_word = {
+        1: "one",
+        2: "two",
+        3: "three",
+        5: "five",
+        7: "seven",
+        14: "fourteen",
+        30: "thirty",
+    }.get(days, str(days))
+    return (
+        f"Sleep Contract read-back: when alarm {incident.get('alarm_name')} "
+        "fires again, "
+        f"Night Shift may run {action} on exactly {scope}, at most {max_uses} times, "
+        f"for {day_word} days. Say 'grant contract for {day_word} days' to confirm."
+    )
+
+
+_SPOKEN_ACTION = {
+    "networkpolicy.restore_ingress": "restore the missing network policy rule",
+    "networkpolicy.revoke_ingress": "remove that network policy rule again",
+    "deployment.restart": "restart the deployment",
+    "deployment.rollback": "roll the deployment back to its previous revision",
+}
+
+
+def _spoken_scope(action: str, params: dict[str, Any]) -> str:
+    """The scope as a human says it: no resource ids, port and direction only."""
+    if action.startswith("networkpolicy."):
+        return (
+            f"the {params.get('protocol', 'TCP')} port {params.get('port')} rule from "
+            f"the {params.get('from_app')} pods into the {params.get('name')} policy"
+        )
+    if action.startswith("deployment."):
+        return (
+            f"the {params.get('name', 'demo')} deployment in the "
+            f"{params.get('namespace', '')} namespace"
+        )
+    return "that one resource"
+
+
+def spoken_blast_radius(action: str, params: dict[str, Any]) -> str:
+    """Blast radius for the ear; the exact ids stay on screen."""
+    what = _SPOKEN_ACTION.get(action, action)
+    return f"One change: {what}, {_spoken_scope(action, params)}. Nothing else changes."
+
+
+def _read_back_spoken(
+    incident: dict[str, Any],
+    action: str,
+    params: dict[str, Any],
+    days: int,
+    max_uses: int,
+) -> str:
+    day_word = {
+        1: "one",
+        2: "two",
+        3: "three",
+        5: "five",
+        7: "seven",
+        14: "fourteen",
+        30: "thirty",
+    }.get(days, str(days))
+    what = _SPOKEN_ACTION.get(action, action)
+    return (
+        f"Read-back: next time this alarm fires, I may {what}, "
+        f"{_spoken_scope(action, params)}, at most {max_uses} times, "
+        f"for {day_word} days. To confirm, say: grant contract for {day_word} days."
+    )
+
+
+@observability.span("tool:grant_sleep_contract")
+def grant_sleep_contract(days: int = 7, max_uses: int = 3) -> dict[str, Any]:
+    """Grant a scoped, expiring standing approval; read-back first, then the phrase."""
+    ctx = current()
+    incident = _incident()
+    days = max(1, min(int(days), 30))
+    max_uses = max(1, min(int(max_uses), 10))
+    beacon_json = _rca(incident).get("beacon_json") or {}
+    action = beacon_json.get("suggested_action")
+    params = beacon_json.get("action_params")
+    if not action or not isinstance(params, dict):
+        return {
+            "granted": False,
+            "error": "no allowlisted action on this incident to contract",
+        }
+    try:
+        params = registry.validate_params(str(action), params)
+    except ParamError as exc:
+        return {"granted": False, "error": f"cannot contract: {exc}"}
+
+    pending = incident.get("contract_readback_pending") or {}
+    spoken = _normalise(ctx.transcript)
+    said_grant = any(p.search(spoken) for p in _GRANT_PATTERNS)
+
+    if not pending or not said_grant or not ctx.passcode_ok or not _apply_enabled():
+        read_back = _read_back(incident, str(action), params, days, max_uses)
+        store.update_status(
+            incident["incident_id"],
+            str(incident.get("status") or "resolved"),
+            table_name=_incidents_table(),
+            extra={
+                "contract_readback_pending": {
+                    "days": days,
+                    "max_uses": max_uses,
+                    "action": action,
+                }
+            },
+        )
+        _tool_event(
+            "grant_sleep_contract",
+            {"days": days, "max_uses": max_uses},
+            "read-back issued, awaiting explicit grant phrase",
+        )
+        error = None
+        if not ctx.passcode_ok:
+            error = "the session is not authorised (passcode missing)"
+        elif not _apply_enabled():
+            error = "remediation is disabled (APPLY_ENABLED=false)"
+        return {
+            "granted": False,
+            "read_back_pending": True,
+            "read_back": read_back,
+            "read_back_spoken": _read_back_spoken(
+                incident, str(action), params, days, max_uses
+            ),
+            "error": error,
+            "instruction": (
+                "Speak read_back_spoken aloud verbatim (the exact scope is on screen) "
+                "and wait for the exact phrase."
+            ),
+        }
+
+    held = _hold_if_unverified(
+        "grant_sleep_contract",
+        {"days": days, "max_uses": max_uses},
+        {"granted": False},
+        "grant the contract",
+    )
+    if held:
+        return held
+    record = contracts.put(
+        alarm_name=str(incident.get("alarm_name")),
+        action=str(action),
+        params=params,
+        days=int(pending.get("days", days)),
+        max_uses=int(pending.get("max_uses", max_uses)),
+        transcript_quote=_quote(ctx),
+        granted_by=ctx.channel,
+        incident_id=incident["incident_id"],
+        table_name=_contracts_table(),
+        attestation=ctx.attestation,
+    )
+    store.update_status(
+        incident["incident_id"],
+        str(incident.get("status") or "resolved"),
+        table_name=_incidents_table(),
+        extra={"contract_readback_pending": None, "contract_id": record["contract_id"]},
+    )
+    store.append_timeline(
+        incident["incident_id"],
+        "contract_granted",
+        table_name=_incidents_table(),
+        detail={
+            "contract_id": record["contract_id"],
+            "days": record["days"],
+            "max_uses": record["max_uses"],
+            "transcript_quote": record["transcript_quote"],
+        },
+    )
+    _tool_event(
+        "grant_sleep_contract",
+        {"days": record["days"], "max_uses": record["max_uses"]},
+        f'granted: "{record["transcript_quote"]}"',
+    )
+    return {
+        "granted": True,
+        "contract_id": record["contract_id"],
+        "expires_at": record["expires_at"],
+        "days": record["days"],
+        "max_uses": record["max_uses"],
+        "scope": params,
+        "instruction": (
+            "Confirm the contract in one sentence and wish the engineer good night."
+        ),
+    }
+
+
+@observability.span("tool:cancel_proposal")
+def cancel_proposal(
+    fix_id: int, reason: str = "engineer interrupted"
+) -> dict[str, Any]:
+    """Withdraw a pending proposal: after this, 'approve fix <n>' needs a fresh
+    propose_fix. The console calls it when the engineer barges in on a read-back;
+    the agent may call it when the engineer says no, stop, or wait."""
+    incident = _incident()
+    withdrawn = approvals.withdraw_proposal(
+        incident["incident_id"],
+        int(fix_id),
+        reason=reason,
+        table_name=_approvals_table(),
+    )
+    invalidated = approvals.invalidate_for_fix(
+        incident["incident_id"],
+        int(fix_id),
+        reason=reason,
+        table_name=_approvals_table(),
+    )
+    clear_pending(incident["incident_id"], "approve_fix", int(fix_id))
+    if withdrawn or invalidated:
+        store.append_timeline(
+            incident["incident_id"],
+            "proposal_withdrawn",
+            table_name=_incidents_table(),
+            detail={"fix_id": int(fix_id), "reason": reason[:200]},
+        )
+    _tool_event(
+        "cancel_proposal",
+        {"fix_id": fix_id},
+        f"withdrew fix {fix_id}" if withdrawn else f"no pending fix {fix_id}",
+    )
+    return {
+        "withdrawn": withdrawn,
+        "fix_id": int(fix_id),
+        "spoken_hint": (
+            "Fix withdrawn; nothing was applied. Ask again if you want it proposed."
+            if withdrawn
+            else "There was no pending fix to withdraw."
+        ),
+    }
+
+
+@observability.span("tool:undo_fix")
+def undo_fix(fix_id: int, confirmation_phrase: str) -> dict[str, Any]:
+    """Reverse fix *fix_id* that Night Shift applied, if the engineer said "undo fix <n>".
+
+    Undo is its own allowlisted action (the fix's ``inverse``), goes through the
+    same dry run under the remediator role, is recorded as an approval that
+    quotes the transcript, and executes once. Only fixes Night Shift executed for
+    this incident can be undone; the incident goes back to awaiting a human.
+    """
+    ctx = current()
+    phrase = registry.undo_phrase(int(fix_id))
+    refusal: dict[str, Any] = {"undone": False, "fix_id": int(fix_id)}
+    if not ctx.passcode_ok:
+        _tool_event("undo_fix", {"fix_id": fix_id}, "refused: no passcode")
+        return {**refusal, "error": "the session is not authorised (passcode missing)"}
+    if not _apply_enabled():
+        _tool_event("undo_fix", {"fix_id": fix_id}, "refused: apply disabled")
+        return {**refusal, "error": "remediation is disabled (APPLY_ENABLED=false)"}
+    if phrase not in _normalise(ctx.transcript):
+        _tool_event("undo_fix", {"fix_id": fix_id}, "refused: phrase not in transcript")
+        return {**refusal, "error": f"I need you to say exactly '{phrase}' to undo"}
+
+    incident = _incident()
+    done = [
+        a
+        for a in approvals.list_for_incident(
+            incident["incident_id"], table_name=_approvals_table()
+        )
+        if a.get("kind", "approval") == "approval"
+        and a.get("fix_id") == int(fix_id)
+        and a.get("used_at")
+        and (a.get("execute_result") or {}).get("ok")
+    ]
+    if not done:
+        return {**refusal, "error": f"fix {fix_id} was not applied by Night Shift here"}
+    applied = done[-1]
+    spec = registry.get_action(str(applied["action"]))
+    inverse = registry.get_action(spec.inverse or "") if spec else None
+    if spec is None or inverse is None:
+        return {**refusal, "error": f"{applied.get('action')} has no undo"}
+    params = dict(applied["params"])
+    dry = _invoke_remediate({"step": "dryrun", "action": inverse.id, "params": params})
+    if not dry.get("ok"):
+        _tool_event("undo_fix", {"fix_id": fix_id}, "dry run failed")
+        return {
+            **refusal,
+            "error": f"undo dry run failed: {dry.get('error') or dry.get('code')}",
+        }
+    held = _hold_if_unverified("undo_fix", {"fix_id": int(fix_id)}, refusal, phrase)
+    if held:
+        return held
+    record = approvals.create(
+        incident["incident_id"],
+        inverse.id,
+        params,
+        source="voice",
+        channel=ctx.channel,
+        transcript_quote=_quote(ctx),
+        fix_id=int(fix_id),
+        table_name=_approvals_table(),
+        attestation=ctx.attestation,
+    )
+    result = _invoke_remediate(
+        {
+            "step": "execute",
+            "approval_id": record["approval_id"],
+            "incident_id": incident["incident_id"],
+            "action": inverse.id,
+            "params": params,
+        }
+    )
+    ok = bool(result.get("ok"))
+    store.append_timeline(
+        incident["incident_id"],
+        "undone" if ok else "undo_failed",
+        table_name=_incidents_table(),
+        detail={
+            "fix_id": int(fix_id),
+            "action": inverse.id,
+            "channel": ctx.channel,
+            "transcript_quote": ctx.transcript.strip(),
+            "approval_id": record["approval_id"],
+            "code": result.get("code"),
+        },
+    )
+    if ok:
+        store.update_status(
+            incident["incident_id"],
+            "awaiting_engineer",
+            table_name=_incidents_table(),
+            extra={"undone_at": result.get("executed_at"), "woken": True},
+        )
+    summary = (
+        f"undid fix {fix_id} ({inverse.id})"
+        if ok
+        else f"undo failed: {result.get('code')}"
+    )
+    if ok:
+        channels.send(
+            "undone",
+            f"Undo: {inverse.id} on {incident.get('alarm_name') or 'incident'}",
+            f'"{ctx.transcript.strip()}" — {inverse.blast_radius(params)}',
+            incident_id=incident["incident_id"],
+        )
+    _tool_event("undo_fix", {"fix_id": fix_id}, summary)
+    return {
+        **refusal,
+        "undone": ok,
+        "action": inverse.id,
+        "blast_radius": inverse.blast_radius(params),
+        "result": result,
+        "spoken_hint": (
+            "The rule is removed again and the alarm will return; you are back to "
+            "awaiting a decision."
+            if ok
+            else "The undo did not go through."
+        ),
+    }
+
+
+@observability.span("tool:open_fix_pr")
+def open_fix_pr(confirmation_phrase: str = "") -> dict[str, Any]:
+    """Open the pull request that fixes the cause in the infrastructure code.
+
+    Consent tool: the phrase must be in the transcript and a fix must have been
+    applied on this incident. The patch and the PR text come from code; nothing
+    is merged.
+    """
+    from beacon import fix_pr, reports
+
+    ctx = current()
+    incident = _incident()
+    refusal = {"opened": False, "phrase": fix_pr.PHRASE}
+    if not fix_pr.configured():
+        _tool_event("open_fix_pr", {}, "refused: not configured")
+        return {
+            **refusal,
+            "error": "fix-at-source is not configured on this deployment",
+        }
+    if not fix_pr.said_phrase(ctx.transcript):
+        _tool_event("open_fix_pr", {}, "refused: phrase not in transcript")
+        return {
+            **refusal,
+            "error": f"I need you to say exactly '{fix_pr.PHRASE}' to open it",
+        }
+    if not ctx.passcode_ok:
+        return {**refusal, "error": "the session is not authorised"}
+    rows = approvals.list_for_incident(
+        incident["incident_id"], table_name=_approvals_table()
+    )
+    applied = [r for r in rows if r.get("kind") == "approval"]
+    if not applied:
+        _tool_event("open_fix_pr", {}, "refused: no fix applied")
+        return {
+            **refusal,
+            "error": "no fix has been applied on this incident; approve one first",
+        }
+    if incident.get("status") != "resolved":
+        _tool_event("open_fix_pr", {}, f"refused: status {incident.get('status')}")
+        return {
+            **refusal,
+            "error": (
+                f"the incident is {str(incident.get('status', '')).replace('_', ' ')}; "
+                "I open the pull request only once the fix has verified"
+            ),
+        }
+    held = _hold_if_unverified("open_fix_pr", {}, refusal, fix_pr.PHRASE)
+    if held:
+        return held
+    approval = applied[-1]
+    postmortem_md = reports.postmortem(
+        incident,
+        contracts=contracts._scan(_contracts_table()),
+        approvals=rows,
+    )
+    try:
+        pr = fix_pr.open_pr(
+            incident,
+            action=str(approval["action"]),
+            params=dict(approval["params"]),
+            postmortem_md=postmortem_md,
+            approval=approval,
+            link=channels.deep_link(incident["incident_id"]),
+        )
+    except Exception as exc:
+        logger.exception("open_fix_pr failed")
+        _tool_event("open_fix_pr", {}, f"failed: {exc}")
+        return {**refusal, "error": f"could not open the pull request: {exc}"}
+    store.append_timeline(
+        incident["incident_id"],
+        "pr_opened",
+        table_name=_incidents_table(),
+        detail={
+            "url": pr["url"],
+            "number": pr["number"],
+            "kind": pr["kind"],
+            "files": pr["files"],
+            "quote": ctx.transcript.strip()[:200],
+            "channel": ctx.channel,
+        },
+    )
+    card = current().add_evidence("pull_request", f"PR #{pr['number']}", pr)
+    _tool_event("open_fix_pr", {}, f"opened {pr['url']}", card["id"])
+    channels.send(
+        "resolved",
+        f"Pull request opened for {incident.get('alarm_name')}",
+        f"{pr['title']}\n{pr['url']}",
+        incident_id=incident["incident_id"],
+    )
+    return {
+        **pr,
+        "opened": True,
+        "evidence": [card],
+        "spoken_hint": (
+            f"Pull request {pr['number']} is open"
+            + (
+                " with the template change and the postmortem."
+                if pr["kind"] == "template_patch"
+                else f" with the postmortem; {pr['reason']}."
+            )
+            + " Nothing is merged; review it in daylight."
+        ),
+    }
+
+
+@observability.span("tool:check_recovery")
+def check_recovery() -> dict[str, Any]:
+    """Where the remediation loop is: status, last verify attempt, timings."""
+    incident = _incident()
+    verifies = [
+        e for e in incident.get("timeline", []) if e.get("event") == "verify_attempt"
+    ]
+    last = (verifies[-1].get("detail") or {}) if verifies else {}
+    out: dict[str, Any] = {
+        "status": incident.get("status"),
+        "executed_at": incident.get("executed_at"),
+        "resolved_at": incident.get("resolved_at"),
+        "handled_by": incident.get("handled_by"),
+        "last_verify": {
+            "attempt": last.get("attempt"),
+            "ok": last.get("ok"),
+            "checks": last.get("checks", []),
+        }
+        if last
+        else None,
+    }
+    evidence_id: str | None = None
+    if last:
+        # "Recovered" is a claim; pin it to the verify record the loop wrote.
+        checks = last.get("checks", [])
+        passed = sum(1 for c in checks if c.get("ok"))
+        card = current().add_evidence(
+            "verify",
+            f"Verification {passed}/{len(checks)} (attempt {last.get('attempt')})",
+            {
+                "executed_at": incident.get("executed_at"),
+                "resolved_at": incident.get("resolved_at"),
+                "checks": checks,
+            },
+        )
+        out["evidence"] = [card]
+        evidence_id = card["id"]
+    _tool_event("check_recovery", {}, f"status {out['status']}", evidence_id)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Schemas (the cross-backend contract)
+# ---------------------------------------------------------------------------
+
+TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "get_incident_brief",
+        "description": (
+            "Get the incident summary, severity, likely cause and the suggested fix. "
+            "Call this first."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_evidence",
+        "description": (
+            "Fetch evidence of one kind for the current incident: logs, metrics, "
+            "changes (cluster and deployment changes before the alert), diagnostics "
+            "(NetworkPolicy drift, Deployment health), or rca."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["logs", "metrics", "changes", "diagnostics", "rca"],
+                }
+            },
+            "required": ["kind"],
+        },
+    },
+    {
+        "name": "propose_fix",
+        "description": (
+            "Propose the one allowlisted fix for this incident. Call it as soon as "
+            "the engineer asks to fix, repair or restore anything; do not ask for "
+            "permission first, it only runs a dry run and changes nothing. Returns "
+            "the blast radius and the exact confirmation phrase to say."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "approve_fix",
+        "description": (
+            "Apply a proposed fix. Only succeeds if the engineer literally said "
+            "'approve fix <n>' in this turn; the server checks the transcript. "
+            "Then a verified remediation loop runs."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fix_id": {
+                    "type": "integer",
+                    "description": "The fix number from propose_fix",
+                },
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": "What the engineer said, e.g. 'approve fix 1'",
+                },
+            },
+            "required": ["fix_id", "confirmation_phrase"],
+        },
+    },
+    {
+        "name": "cancel_proposal",
+        "description": (
+            "Withdraw a proposed fix that has not been approved, so 'approve fix <n>' "
+            "no longer works until it is proposed again. Call it when the engineer "
+            "says no, stop, wait, or cancel while a fix is pending. Never call it to "
+            "undo an applied fix; that is undo_fix."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fix_id": {"type": "integer", "description": "The pending fix number"},
+                "reason": {
+                    "type": "string",
+                    "description": "Why, e.g. 'engineer said stop'",
+                },
+            },
+            "required": ["fix_id"],
+        },
+    },
+    {
+        "name": "undo_fix",
+        "description": (
+            "Reverse a fix Night Shift already applied in this incident. Only succeeds "
+            "if the engineer literally said 'undo fix <n>' in this turn; the server "
+            "checks the transcript. Do not call for fixes that were not applied."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fix_id": {
+                    "type": "integer",
+                    "description": "The fix number that was applied",
+                },
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": "What the engineer said, e.g. 'undo fix 1'",
+                },
+            },
+            "required": ["fix_id", "confirmation_phrase"],
+        },
+    },
+    {
+        "name": "grant_sleep_contract",
+        "description": (
+            "Grant Night Shift a standing approval to run this same fix for this alarm "
+            "next time without waking anyone. Two calls, never ask questions in "
+            "between: (1) the moment the engineer agrees to a contract in any words "
+            "(yes, sure, haan, go ahead, do it) call it with days 7 and max_uses 3; "
+            "it returns read_back_spoken to say aloud and the phrase to wait for. "
+            "(2) when the engineer says 'grant contract for <n> days' call it again "
+            "with days <n>; only then is it granted."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "How many days the contract lasts (1-30)",
+                    "default": 7,
+                },
+                "max_uses": {
+                    "type": "integer",
+                    "description": "How many times it may be used (1-10)",
+                    "default": 3,
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "open_fix_pr",
+        "description": (
+            "After a fix is applied and verified, open the pull request that fixes "
+            "the cause in the infrastructure code (plus the postmortem). Consent "
+            "tool: call it only when the engineer says 'open the pull request' "
+            "(or 'pull request kholo'), passing those words as "
+            "confirmation_phrase. Never merges. Offer it once, in one sentence, "
+            "after the Sleep Contract question is settled."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": "The engineer's words, e.g. 'open the pull request'",
+                }
+            },
+            "required": ["confirmation_phrase"],
+        },
+    },
+    {
+        "name": "check_recovery",
+        "description": (
+            "Check whether the remediation loop has verified recovery "
+            "(alarm OK after the fix, error metric zero, post-condition)."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
+    "get_incident_brief": get_incident_brief,
+    "get_evidence": get_evidence,
+    "propose_fix": propose_fix,
+    "approve_fix": approve_fix,
+    "cancel_proposal": cancel_proposal,
+    "undo_fix": undo_fix,
+    "grant_sleep_contract": grant_sleep_contract,
+    "open_fix_pr": open_fix_pr,
+    "check_recovery": check_recovery,
+}
+
+
+# Bolna knows the evidence tool by the name in the product brief.
+BOLNA_ALIASES = {"get_incident_evidence": "get_evidence"}
+
+
+def bolna_tool_schemas() -> list[dict[str, Any]]:
+    """TOOL_SCHEMAS as Bolna custom functions see them.
+
+    Same nine tools; the evidence tool is exposed as ``get_incident_evidence``
+    and the contract tool gains the phrase argument the other consent tools
+    already have, so the backend can tell a read-back request from a grant.
+    """
+    reverse = {v: k for k, v in BOLNA_ALIASES.items()}
+    out = []
+    for schema in TOOL_SCHEMAS:
+        item = json.loads(json.dumps(schema))
+        item["name"] = reverse.get(item["name"], item["name"])
+        if item["name"] == "grant_sleep_contract":
+            item["parameters"]["properties"]["confirmation_phrase"] = {
+                "type": "string",
+                "description": "The engineer's words when they grant the contract",
+            }
+        out.append(item)
+    return out
+
+
+def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Run one tool by name with JSON args (used by every backend)."""
+    fn = TOOL_FUNCTIONS.get(name)
+    if fn is None:
+        return {"error": f"unknown tool {name}"}
+    try:
+        return fn(**args)
+    except TypeError as exc:
+        return {"error": f"bad arguments for {name}: {exc}"}
+    except LookupError as exc:
+        return {"error": str(exc)}

@@ -1,0 +1,15 @@
+# Record who changed what: metadata for every write, nothing for reads.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+  - level: None
+    verbs: [get, list, watch]
+  - level: None
+    resources:
+      - {group: "", resources: [events, endpoints]}
+      - {group: coordination.k8s.io, resources: [leases]}
+      - {group: authentication.k8s.io}
+      - {group: authorization.k8s.io}
+  - level: Metadata
+    verbs: [create, update, patch, delete, deletecollection]

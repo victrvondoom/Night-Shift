@@ -1,0 +1,276 @@
+# Prometheus + Alertmanager (detection), Loki + Promtail (logs), Grafana, OpenTelemetry Collector.
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: prometheus, namespace: beacon}
+data:
+  prometheus.yml: |
+    global: {scrape_interval: 5s, evaluation_interval: 5s}
+    rule_files: [/etc/prometheus/rules.yml]
+    alerting:
+      alertmanagers: [{static_configs: [{targets: ["alertmanager:9093"]}]}]
+    scrape_configs:
+      - job_name: demo-api
+        static_configs: [{targets: ["demo-api.demo.svc:8080"], labels: {namespace: demo}}]
+      - job_name: beacon-api
+        static_configs: [{targets: ["beacon-api:8080"]}]
+      - job_name: beacon-worker
+        static_configs: [{targets: ["beacon-worker:9102"]}]
+  rules.yml: |
+    groups:
+      - name: demo
+        rules:
+          - alert: DemoDbErrors
+            expr: sum by (namespace) (rate(demo_db_requests_total{result="error"}[30s])) > 0
+            for: 10s
+            labels: {severity: page, namespace: demo, service: demo-api}
+            annotations:
+              summary: demo-api cannot reach its database
+              description: demo-api requests to demo-db are failing
+              beacon_health_url: http://demo-api.demo.svc:8080/ready
+          - alert: DemoApiDown
+            expr: up{job="demo-api"} == 0
+            for: 15s
+            labels: {severity: page, namespace: demo, service: demo-api}
+            annotations:
+              summary: demo-api is down
+              description: Prometheus cannot scrape demo-api; no pod is serving
+              beacon_health_url: http://demo-api.demo.svc:8080/ready
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: prometheus, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata: {labels: {app: prometheus}}
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=1d"]
+          ports: [{containerPort: 9090}]
+          volumeMounts: [{name: config, mountPath: /etc/prometheus}]
+      volumes: [{name: config, configMap: {name: prometheus}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: beacon}
+spec:
+  selector: {app: prometheus}
+  ports: [{port: 9090}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: alertmanager, namespace: beacon}
+data:
+  alertmanager.yml: |
+    route:
+      receiver: beacon
+      group_by: [alertname, namespace]
+      group_wait: 0s
+      group_interval: 30s
+      repeat_interval: 4h
+    receivers:
+      - name: beacon
+        webhook_configs:
+          - url: http://beacon-api:8080/alerts
+            send_resolved: false
+            http_config:
+              authorization: {type: Bearer, credentials_file: /secrets/ALERT_WEBHOOK_TOKEN}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: alertmanager, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: alertmanager}}
+  template:
+    metadata: {labels: {app: alertmanager}}
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+          ports: [{containerPort: 9093}]
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager}
+            - {name: secrets, mountPath: /secrets}
+      volumes:
+        - {name: config, configMap: {name: alertmanager}}
+        - {name: secrets, secret: {secretName: beacon-app-secrets}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: alertmanager, namespace: beacon}
+spec:
+  selector: {app: alertmanager}
+  ports: [{port: 9093}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: loki, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: loki}}
+  template:
+    metadata: {labels: {app: loki}}
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.3.2
+          args: ["-config.file=/etc/loki/local-config.yaml"]
+          ports: [{containerPort: 3100}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: loki, namespace: beacon}
+spec:
+  selector: {app: loki}
+  ports: [{port: 3100}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: promtail, namespace: beacon}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: beacon-promtail}
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: beacon-promtail}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: beacon-promtail}
+subjects: [{kind: ServiceAccount, name: promtail, namespace: beacon}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: promtail, namespace: beacon}
+data:
+  # LOG_FORMAT is "cri" on containerd (k3d, most clusters) and "docker" on a Docker runtime.
+  promtail.yml: |
+    server: {http_listen_port: 9080, grpc_listen_port: 0}
+    positions: {filename: /tmp/positions.yaml}
+    clients: [{url: "http://loki:3100/loki/api/v1/push"}]
+    scrape_configs:
+      - job_name: pods
+        kubernetes_sd_configs: [{role: pod}]
+        pipeline_stages:
+          - ${LOG_FORMAT}: {}
+        relabel_configs:
+          - {source_labels: [__meta_kubernetes_pod_node_name], target_label: __host__}
+          - {source_labels: [__meta_kubernetes_namespace], target_label: namespace}
+          - {source_labels: [__meta_kubernetes_pod_name], target_label: pod}
+          - {source_labels: [__meta_kubernetes_pod_label_app], target_label: app}
+          - {source_labels: [__meta_kubernetes_pod_container_name], target_label: container}
+          - source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+            separator: /
+            target_label: __path__
+            replacement: /var/log/pods/*$1/*.log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: promtail, namespace: beacon}
+spec:
+  selector: {matchLabels: {app: promtail}}
+  template:
+    metadata: {labels: {app: promtail}}
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.3.2
+          args: ["-config.file=/etc/promtail/promtail.yml", "-config.expand-env=true"]
+          env:
+            - name: HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: LOG_FORMAT
+              valueFrom: {configMapKeyRef: {name: beacon-env, key: LOG_FORMAT}}
+          securityContext: {runAsUser: 0}
+          volumeMounts:
+            - {name: config, mountPath: /etc/promtail}
+            - {name: varlog, mountPath: /var/log, readOnly: true}
+            - {name: docker, mountPath: /var/lib/docker/containers, readOnly: true}
+      volumes:
+        - {name: config, configMap: {name: promtail}}
+        - {name: varlog, hostPath: {path: /var/log}}
+        - {name: docker, hostPath: {path: /var/lib/docker/containers}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-datasources, namespace: beacon}
+data:
+  datasources.yml: |
+    apiVersion: 1
+    datasources:
+      - {name: Prometheus, type: prometheus, url: "http://prometheus:9090", isDefault: true}
+      - {name: Loki, type: loki, url: "http://loki:3100"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grafana, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grafana}}
+  template:
+    metadata: {labels: {app: grafana}}
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          env:
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}
+            - {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Viewer}
+          ports: [{containerPort: 3000}]
+          volumeMounts: [{name: ds, mountPath: /etc/grafana/provisioning/datasources}]
+      volumes: [{name: ds, configMap: {name: grafana-datasources}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grafana, namespace: beacon}
+spec:
+  type: NodePort
+  selector: {app: grafana}
+  ports: [{port: 3000, nodePort: 30300}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: otel-collector, namespace: beacon}
+data:
+  config.yaml: |
+    receivers:
+      otlp: {protocols: {http: {endpoint: "0.0.0.0:4318"}, grpc: {endpoint: "0.0.0.0:4317"}}}
+    processors: {batch: {}}
+    exporters:
+      debug: {verbosity: basic}
+    service:
+      pipelines:
+        traces: {receivers: [otlp], processors: [batch], exporters: [debug]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: otel-collector, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: otel-collector}}
+  template:
+    metadata: {labels: {app: otel-collector}}
+    spec:
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector:0.116.1
+          args: ["--config=/etc/otel/config.yaml"]
+          ports: [{containerPort: 4318}, {containerPort: 4317}]
+          volumeMounts: [{name: config, mountPath: /etc/otel}]
+      volumes: [{name: config, configMap: {name: otel-collector}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: otel-collector, namespace: beacon}
+spec:
+  selector: {app: otel-collector}
+  ports: [{name: http, port: 4318}, {name: grpc, port: 4317}]

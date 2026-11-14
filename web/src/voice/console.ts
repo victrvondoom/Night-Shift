@@ -1,0 +1,124 @@
+/**
+ * The console voice path behind the VoiceTransport interface:
+ * push-to-talk Web Speech or typed text → POST /voice/turn (local model on Ollama) → browser speech.
+ * Half-duplex by design: `sendAudio` is a no-op (the STT transport owns the mic), and
+ * `interrupt()` stops playback.
+ */
+import type { Api } from "../api";
+import type { TurnResponse } from "../types";
+import { Player, speakFallback } from "./player";
+import type { SttChoice } from "./stt";
+import type { VoiceSession, VoiceTransport, VoiceTransportHandlers } from "./transport";
+import { WebSpeechTransport } from "./webspeech";
+
+export class ConsoleTransport implements VoiceTransport {
+  readonly name = "console" as const;
+  private h: VoiceTransportHandlers | null = null;
+  private session: VoiceSession | null = null;
+  private stt: WebSpeechTransport | null = null;
+  private player = new Player();
+  private listening = false;
+
+  constructor(
+    private readonly api: Api,
+    _sttChoice: SttChoice,
+    private readonly sttLanguage: string,
+  ) {}
+
+  async start(session: VoiceSession, handlers: VoiceTransportHandlers): Promise<void> {
+    this.session = session;
+    this.h = handlers;
+    handlers.onState("idle");
+  }
+
+  /** Push-to-talk: call on pointer down. */
+  async beginListening(): Promise<void> {
+    if (this.listening || !this.h) return;
+    const h = this.h;
+    this.player.stop();
+    this.stt = new WebSpeechTransport(this.sttLanguage);
+    this.listening = true;
+    h.onState("listening");
+    await this.stt.start({
+      onPartial: (text) => h.onUserTranscript({ text, final: false }),
+      onFinal: (text) => {
+        h.onUserTranscript({ text, final: true });
+        void this.sendText(text, this.stt?.name ?? "webspeech");
+      },
+      onError: (message) => {
+        h.onError(message);
+        h.onState("error");
+      },
+    });
+  }
+
+  /** Push-to-talk: call on pointer up. */
+  async endListening(): Promise<void> {
+    const stt = this.stt;
+    this.stt = null;
+    this.listening = false;
+    if (stt) await stt.stop();
+  }
+
+  sendAudio(): void {
+    /* the STT transport owns the microphone in this backend */
+  }
+
+  async inject(content: string): Promise<void> {
+    // The cascade has an explicit event turn on the server; reuse the resolved/escalated wording.
+    const status = /escalat/i.test(content) ? "escalated" : "resolved";
+    if (!this.h || !this.session) return;
+    this.h.onState("thinking");
+    try {
+      const resp = await this.api.turn({ incident_id: this.session.incidentId, session_id: this.session.sessionId, mode: "event", event: status, lang: this.sttLanguage });
+      await this.deliver(resp);
+    } catch (e) {
+      this.h.onError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async sendText(text: string, channel = "typed"): Promise<void> {
+    if (!this.h || !this.session) return;
+    const h = this.h;
+    h.onState("thinking");
+    let resp: TurnResponse;
+    try {
+      resp = await this.api.turn({
+        incident_id: this.session.incidentId,
+        session_id: this.session.sessionId,
+        text,
+        channel,
+        lang: this.sttLanguage,
+      });
+    } catch (e) {
+      h.onError(e instanceof Error ? e.message : String(e));
+      h.onState("error");
+      return;
+    }
+    await this.deliver(resp);
+  }
+
+  private async deliver(resp: TurnResponse): Promise<void> {
+    const h = this.h!;
+    for (const ev of resp.tool_events) h.onToolResult(ev.name, ev.args, ev.summary, [ev], resp.evidence);
+    h.onAgentText({ text: resp.reply_text, cited: resp.cited });
+    h.onState("speaking");
+    const done = () => {
+      h.onAgentDone("completed");
+      h.onState("idle");
+    };
+    if (resp.audio_b64) await this.player.play(resp.audio_b64, resp.speech_marks, () => undefined, done);
+    else speakFallback(resp.spoken_text || resp.reply_text, done);
+  }
+
+  interrupt(): void {
+    this.player.stop();
+    this.h?.onAgentDone("interrupted");
+    this.h?.onState("idle");
+  }
+
+  async stop(): Promise<void> {
+    await this.endListening();
+    this.player.stop();
+  }
+}

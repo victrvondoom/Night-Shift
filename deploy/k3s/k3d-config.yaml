@@ -1,0 +1,22 @@
+# k3d cluster for Night Shift: `k3d cluster create --config deploy/k3s/k3d-config.yaml`
+# Publishes the console (30080), the API (30081) and Grafana (30300), and turns on
+# the API server audit log with Night Shift as its webhook backend.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: beacon
+servers: 1
+ports:
+  - {port: "30080:30080", nodeFilters: [server:0]}
+  - {port: "30081:30081", nodeFilters: [server:0]}
+  - {port: "30300:30300", nodeFilters: [server:0]}
+volumes:
+  - volume: ${PWD}/deploy/k3s:/etc/beacon-audit
+    nodeFilters: [server:0]
+options:
+  k3s:
+    extraArgs:
+      - {arg: --disable=traefik, nodeFilters: [server:*]}
+      - {arg: --kube-apiserver-arg=audit-policy-file=/etc/beacon-audit/audit-policy.yaml, nodeFilters: [server:*]}
+      - {arg: --kube-apiserver-arg=audit-webhook-config-file=/etc/beacon-audit/audit-webhook.yaml, nodeFilters: [server:*]}
+      - {arg: --kube-apiserver-arg=audit-webhook-batch-max-wait=2s, nodeFilters: [server:*]}

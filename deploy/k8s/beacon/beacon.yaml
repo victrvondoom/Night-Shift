@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: beacon-env, namespace: beacon}
+data:
+  LOG_FORMAT: cri
+  NATS_URL: nats://nats:4222
+  TEMPORAL_ADDRESS: temporal:7233
+  OPA_URL: http://opa:8181
+  PROMETHEUS_URL: http://prometheus:9090
+  LOKI_URL: http://loki:3100
+  OLLAMA_API_BASE: http://ollama:11434
+  LLM_MODEL_ID: ollama_chat/qwen2.5:1.5b
+  EMBEDDING_MODEL_ID: ollama/nomic-embed-text
+  VAULT_ADDR: http://vault:8200
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: beacon
+  MINIO_BUCKET: beacon-audit
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  BEACON_NAMESPACE: beacon
+  LOG_SELECTORS: '{namespace="demo"}'
+  REMEDIABLE_NAMESPACES: demo
+  REMEDIABLE_DEPLOYMENTS: demo/demo-api
+  GOLDEN_TARGETS: demo/demo-db-ingress
+  LOOKBACK_MINUTES: "10"
+  DASHBOARD_URL: http://localhost:30080
+  APPLY_ENABLED: "true"
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+  NO_PROXY: "localhost,127.0.0.1,.svc,.cluster.local,postgres,nats,temporal,opa,prometheus,loki,ollama,vault,minio,otel-collector,beacon-api,10.0.0.0/8"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: beacon-api, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: beacon-api}}
+  template:
+    metadata: {labels: {app: beacon-api}}
+    spec:
+      serviceAccountName: beacon-api
+      containers:
+        - name: api
+          image: beacon:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: {name: beacon-env}
+            - configMapRef: {name: beacon-proxy, optional: true}
+          env:
+            - {name: OTEL_SERVICE_NAME, value: beacon-api}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: DATABASE_URL}}
+            - name: VAULT_TOKEN
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: VAULT_TOKEN}}
+          ports: [{containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata: {name: beacon-api, namespace: beacon}
+spec:
+  type: NodePort
+  selector: {app: beacon-api}
+  ports: [{port: 8080, nodePort: 30081}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: beacon-worker, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: beacon-worker}}
+  template:
+    metadata: {labels: {app: beacon-worker}}
+    spec:
+      serviceAccountName: beacon-remediator
+      containers:
+        - name: worker
+          image: beacon:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "beacon.worker"]
+          envFrom:
+            - configMapRef: {name: beacon-env}
+            - configMapRef: {name: beacon-proxy, optional: true}
+          env:
+            - {name: OTEL_SERVICE_NAME, value: beacon-worker}
+            - {name: HOME, value: /tmp}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: DATABASE_URL}}
+            - name: VAULT_TOKEN
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: VAULT_TOKEN}}
+            - name: MINIO_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: beacon-bootstrap, key: MINIO_SECRET_KEY}}
+          ports: [{containerPort: 9102}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: beacon-worker, namespace: beacon}
+spec:
+  selector: {app: beacon-worker}
+  ports: [{port: 9102}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: beacon-web-config, namespace: beacon}
+data:
+  config.json: |
+    {"voiceUrl": "/voice", "dashboardUrl": "/api", "region": "local k3d",
+     "voiceBackend": "bolna", "cascadeEnabled": true, "local": false}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: beacon-web, namespace: beacon}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: beacon-web}}
+  template:
+    metadata: {labels: {app: beacon-web}}
+    spec:
+      containers:
+        - name: caddy
+          image: beacon-web:local
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8080}]
+          volumeMounts: [{name: config, mountPath: /config}]
+      volumes: [{name: config, configMap: {name: beacon-web-config}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: beacon-web, namespace: beacon}
+spec:
+  type: NodePort
+  selector: {app: beacon-web}
+  ports: [{port: 8080, nodePort: 30080}]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: beacon-morning-report, namespace: beacon}
+spec:
+  schedule: "30 1 * * *"   # 07:00 IST
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: report
+              image: curlimages/curl:8.11.1
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  curl -fsS -X POST -H "Authorization: Bearer $(cat /secrets/ALERT_WEBHOOK_TOKEN)" \
+                    http://beacon-api:8080/api/schedule/morning-report
+              volumeMounts: [{name: secrets, mountPath: /secrets}]
+          volumes:
+            - {name: secrets, secret: {secretName: beacon-app-secrets}}

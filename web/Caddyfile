@@ -1,0 +1,17 @@
+:8080 {
+	encode gzip
+	@api path /api/* /voice/* /github/events
+	handle @api {
+		reverse_proxy beacon-api:8080
+	}
+	handle /config.json {
+		header Cache-Control "no-store"
+		root * /config
+		file_server
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

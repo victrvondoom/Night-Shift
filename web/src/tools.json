@@ -1,0 +1,149 @@
+[
+  {
+    "name": "get_incident_brief",
+    "description": "Get the incident summary, severity, likely cause and the suggested fix. Call this first.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "get_evidence",
+    "description": "Fetch evidence of one kind for the current incident: logs, metrics, changes (CloudTrail write calls before the alarm), diagnostics (security group drift), or rca.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "logs",
+            "metrics",
+            "changes",
+            "diagnostics",
+            "rca"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    }
+  },
+  {
+    "name": "propose_fix",
+    "description": "Propose the one allowlisted fix for this incident. Call it as soon as the engineer asks to fix, repair or restore anything; do not ask for permission first, it only runs a dry run and changes nothing. Returns the blast radius and the exact confirmation phrase to say.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "approve_fix",
+    "description": "Apply a proposed fix. Only succeeds if the engineer literally said 'approve fix <n>' in this turn; the server checks the transcript. Then a verified remediation loop runs.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "fix_id": {
+          "type": "integer",
+          "description": "The fix number from propose_fix"
+        },
+        "confirmation_phrase": {
+          "type": "string",
+          "description": "What the engineer said, e.g. 'approve fix 1'"
+        }
+      },
+      "required": [
+        "fix_id",
+        "confirmation_phrase"
+      ]
+    }
+  },
+  {
+    "name": "cancel_proposal",
+    "description": "Withdraw a proposed fix that has not been approved, so 'approve fix <n>' no longer works until it is proposed again. Call it when the engineer says no, stop, wait, or cancel while a fix is pending. Never call it to undo an applied fix; that is undo_fix.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "fix_id": {
+          "type": "integer",
+          "description": "The pending fix number"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why, e.g. 'engineer said stop'"
+        }
+      },
+      "required": [
+        "fix_id"
+      ]
+    }
+  },
+  {
+    "name": "undo_fix",
+    "description": "Reverse a fix Night Shift already applied in this incident. Only succeeds if the engineer literally said 'undo fix <n>' in this turn; the server checks the transcript. Do not call for fixes that were not applied.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "fix_id": {
+          "type": "integer",
+          "description": "The fix number that was applied"
+        },
+        "confirmation_phrase": {
+          "type": "string",
+          "description": "What the engineer said, e.g. 'undo fix 1'"
+        }
+      },
+      "required": [
+        "fix_id",
+        "confirmation_phrase"
+      ]
+    }
+  },
+  {
+    "name": "grant_sleep_contract",
+    "description": "Grant Night Shift a standing approval to run this same fix for this alarm next time without waking anyone. Two calls, never ask questions in between: (1) the moment the engineer agrees to a contract in any words (yes, sure, haan, go ahead, do it) call it with days 7 and max_uses 3; it returns read_back_spoken to say aloud and the phrase to wait for. (2) when the engineer says 'grant contract for <n> days' call it again with days <n>; only then is it granted.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "days": {
+          "type": "integer",
+          "description": "How many days the contract lasts (1-30)",
+          "default": 7
+        },
+        "max_uses": {
+          "type": "integer",
+          "description": "How many times it may be used (1-10)",
+          "default": 3
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "open_fix_pr",
+    "description": "After a fix is applied and verified, open the pull request that fixes the cause in the infrastructure code (plus the postmortem). Consent tool: call it only when the engineer says 'open the pull request' (or 'pull request kholo'), passing those words as confirmation_phrase. Never merges. Offer it once, in one sentence, after the Sleep Contract question is settled.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "confirmation_phrase": {
+          "type": "string",
+          "description": "The engineer's words, e.g. 'open the pull request'"
+        }
+      },
+      "required": [
+        "confirmation_phrase"
+      ]
+    }
+  },
+  {
+    "name": "check_recovery",
+    "description": "Check whether the remediation loop has verified recovery (alarm OK after the fix, error metric zero, post-condition).",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+]
