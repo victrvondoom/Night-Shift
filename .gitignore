@@ -214,3 +214,5 @@ web/dist/
 tests/fixtures/real/*.log
 .venv/
 deploy/k3s/audit-webhook.yaml
+
+.demo/

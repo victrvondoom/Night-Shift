@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 SERVICE = "beacon-dashboard"
-# Bearer tokens and Bolna keys must never reach a browser, whatever row they
+# Bearer tokens and OmniDimension keys must never reach a browser, whatever row they
 # were accidentally written into.
 _TOKEN_RE = re.compile(r"\b(bn-[A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9._-]+)")
 _PRIVATE_FIELDS = ("conversation", "rca", "cached_data")
@@ -79,7 +79,7 @@ SAFETY_CONTROLS: list[dict[str, str]] = [
         "A voice request is not consent",
         SAFETY_RULES[3],
         "src/beacon/voice_tools.py",
-        "tests/test_consent.py::test_bolna_approve_is_held_and_nothing_executes",
+        "tests/test_consent.py::test_omnidim_approve_is_held_and_nothing_executes",
     ),
     _control(
         "once",

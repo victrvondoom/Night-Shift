@@ -120,7 +120,7 @@ def _approve_and_wait(incident: dict[str, Any]) -> dict[str, Any]:
         "/voice/tools/approve_fix",
         {
             "incident_id": iid,
-            "channel": "bolna",
+            "channel": "omnidim",
             "transcript": f"approve fix {fix}",
             "args": {"fix_id": fix, "confirmation_phrase": f"approve fix {fix}"},
         },

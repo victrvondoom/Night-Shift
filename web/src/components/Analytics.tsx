@@ -377,7 +377,7 @@ export function Analytics({ data, loading, source, now, onReplay }: { data: Anal
           The night, <em>in numbers.</em>
         </h1>
         <p className="lede">Recovery, sleep and cost across every night Night Shift has worked, computed from the same incidents the board shows.</p>
-        <p className="lede dim-note">Every fix counted here was applied on the exact phrase, confirmed by the engineer after a <b>Bolna</b> voice call, and each one can be re-scored against its own session recording on the Audit page.</p>
+        <p className="lede dim-note">Every fix counted here was applied on the exact phrase, confirmed by the engineer after a <b>OmniDimension</b> voice call, and each one can be re-scored against its own session recording on the Audit page.</p>
       </div>
       <div className="panel-h">
         <h2>Operations analytics</h2>

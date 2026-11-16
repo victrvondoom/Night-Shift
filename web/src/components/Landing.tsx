@@ -54,10 +54,10 @@ const PILLARS = [
 ];
 
 const NIGHT_SHIFT = [
-  { title: "Interrupt it", text: "A live Bolna call in the browser. Speak over a read-back and the fix it was reading is withdrawn — turn-taking with a safety meaning.", tag: "voice" },
+  { title: "Interrupt it", text: "A live OmniDimension voice session in the browser. Speak over a read-back and the fix it was reading is withdrawn — turn-taking with a safety meaning.", tag: "voice" },
   { title: "Answer from your phone", text: "The page lands in Telegram with Talk · Fix 1 · Ack. Type the exact phrase to approve; anything vaguer is refused, and a voice note is asked to be typed.", tag: "telegram" },
   { title: "End it with a pull request", text: "Say “open the pull request” and the missing rule is restored in the Kubernetes manifest, with the postmortem and your approval quoted. Nothing is merged at 2 AM.", tag: "github" },
-  { title: "Proof you can play back", text: "Every approval records where its words came from. The audit page links the Bolna call that led up to the fix: transcript, recording and cost.", tag: "audit" },
+  { title: "Proof you can play back", text: "Every approval records where its words came from. The audit page links the OmniDimension call that led up to the fix: transcript, recording and cost.", tag: "audit" },
 ];
 
 const QUOTES = [
@@ -72,8 +72,8 @@ const FAQ = [
   { q: "What if the fix fails?", a: "Verification needs four things: the alert cleared after the fix, its expression clean, the post-condition, and a passing health check. After the retry window it escalates to a human and says so on the board." },
   { q: "What happens without the model?", a: "Triage falls back to a deterministic summary and the console still shows the alert, the cluster change and the timeline. Diagnosis degrades; the safety checks do not depend on it." },
   { q: "Which parts are the model, and which are code?", a: "The model decides whether to call a tool, and only after your words. Consent is checked in code against words the engineer typed; the patch in the pull request is computed from the parameters that passed the dry run; the PR text, the postmortem and the morning report are rendered from the incident record. No model writes to the cluster or to the repository." },
-  { q: "Does it need a cloud account?", a: "No. `make up` runs everything on a local k3d cluster; only the Bolna voice call needs an outside account." },
-  { q: "What did it cost?", a: "Diagnosis runs on a local model, so it has no per-token price. Bolna reports the cost of each voice call and Night Shift stores it with the call." },
+  { q: "Does it need a cloud account?", a: "No. `make up` runs everything on a local k3d cluster; only the OmniDimension voice call needs an outside account." },
+  { q: "What did it cost?", a: "Diagnosis runs on a local model, so it has no per-token price. OmniDimension reports the cost of each voice call and Night Shift stores it with the call." },
 ];
 
 function Faq() {
@@ -234,7 +234,7 @@ export function Landing({ tally, replay, local, onRunNight }: { tally: Tally | n
             approve fix one
           </div>
         </div>
-        <div className="faint small">Voice by Bolna · running on Kubernetes</div>
+        <div className="faint small">Voice by OmniDimension · running on Kubernetes</div>
       </section>
 
       {/* 2 · ink band */}

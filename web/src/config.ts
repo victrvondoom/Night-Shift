@@ -4,10 +4,10 @@ export interface Config {
   dashboardUrl: string;
   region: string;
   sttLanguage: string;
-  voiceBackend: "console" | "bolna";
+  voiceBackend: "console";
   archivedIncidentId: string;
   replay: boolean;
-  /** Whether the push-to-talk console backend is offered next to the Bolna call. */
+  /** Whether the push-to-talk console backend is offered next to the OmniDimension session. */
   cascadeEnabled: boolean;
   /** Local demo cluster (k3d): enables the "run the night" helpers. */
   local: boolean;
@@ -19,7 +19,7 @@ const DEFAULTS: Config = {
   dashboardUrl: "",
   region: "local",
   sttLanguage: "en-IN",
-  voiceBackend: "bolna",
+  voiceBackend: "console",
   archivedIncidentId: "",
   cascadeEnabled: true,
   replay: false,

@@ -18,7 +18,7 @@ from prometheus_client import start_http_server
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from beacon import changes, eventbus, workflows
+from beacon import changes, eventbus, ingest, workflows
 
 logger = logging.getLogger("beacon.worker")
 
@@ -48,9 +48,18 @@ async def main() -> None:
     if eventbus.url():
         _, js = await eventbus.connect()
         tasks += [
-            eventbus.consume(js, eventbus.ALERTS, "triage", _on_alert, max_deliver=2),
             eventbus.consume(js, eventbus.CHANGES, "ledger", _on_change),
+            eventbus.consume(js, ingest.EVENTS, "evidence", ingest.on_event),
+            eventbus.consume(js, ingest.CORRELATIONS, "correlations", ingest.on_correlation, max_deliver=5),
         ]
+        if os.environ.get("LEGACY_TRIAGE", "true").lower() != "false":
+            # the original Ollama/litellm triage path; the evidence workspace replaces it
+            tasks.append(eventbus.consume(js, eventbus.ALERTS, "triage", _on_alert, max_deliver=2))
+    if os.environ.get("REMEDIATION_MODE", "temporal") == "inline":
+        # no Temporal server: the same remediation steps run in-process (labelled in /api/system/integrations)
+        logger.info("worker up (inline remediation, no Temporal): nats=%s", eventbus.url())
+        await asyncio.gather(*tasks)
+        return
     client = await Client.connect(
         workflows._address(), namespace=workflows._namespace()
     )

@@ -1,7 +1,7 @@
 """The session brief, built once on the server for every voice channel.
 
 The browser, the phone bridge and a replayed test all open the same kind of
-Bolna voice call, and they must open it with the *same* rules: the
+OmniDimension voice call, and they must open it with the *same* rules: the
 same system prompt, the same nine tools, the same key terms, the same greeting.
 That text used to live only in the React component, which meant a channel added
 later would quietly get a different agent -- and "the phone agent behaved
@@ -67,8 +67,8 @@ def system_prompt() -> str:
     )
 
 
-BOLNA_ADDENDUM = (
-    "You are speaking over a Bolna voice call. The incident id is {incident_id}; "
+OMNIDIM_ADDENDUM = (
+    "You are speaking over a OmniDimension voice call. The incident id is {incident_id}; "
     "pass incident_id {incident_id}, beacon_session {beacon_session} and "
     "beacon_token {beacon_token} unchanged on every tool call and never say them "
     "aloud. Start by calling get_incident_brief. Your tool calls are requests, "
@@ -82,9 +82,9 @@ BOLNA_ADDENDUM = (
 )
 
 
-def bolna_prompt() -> str:
-    """The Bolna agent's system prompt: the shared rules plus the consent rule."""
-    return f"{system_prompt()} {BOLNA_ADDENDUM}"
+def omnidim_prompt() -> str:
+    """The OmniDimension agent's system prompt: the shared rules plus the consent rule."""
+    return f"{system_prompt()} {OMNIDIM_ADDENDUM}"
 
 
 def _first(items: Any) -> dict[str, Any]:

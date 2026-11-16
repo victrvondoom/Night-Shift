@@ -108,4 +108,4 @@ def test_python_package_has_no_aws_or_assemblyai_dependency():
     for word in ("boto", "moto", "aws", "assemblyai", "strands"):
         assert word not in text
     web = (ROOT / "web/package.json").read_text().lower()
-    assert "aws" not in web and "assemblyai" not in web and "@bolna/web-call" in web
+    assert "aws" not in web and "assemblyai" not in web and "@omnidim-ai/client" in web and "bolna" not in web

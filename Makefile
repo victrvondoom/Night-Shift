@@ -4,7 +4,7 @@ PY ?= .venv/bin/python
 K3D_CLUSTER ?= beacon
 export K3D_CLUSTER
 
-.PHONY: help setup test-services test lint web cluster up down snapshot break-netpol bad-deploy restore e2e bolna-agent logs
+.PHONY: help setup test-services test lint web cluster up down snapshot break-netpol bad-deploy restore e2e logs demo-up demo-status demo-trigger demo-reset demo-verify demo-down hackathon-verify
 
 help:
 	@grep -E '^[a-z0-9-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -50,8 +50,26 @@ restore: ## put the demo back by hand
 e2e: ## both demos and the RBAC checks against the live cluster
 	BEACON_E2E=1 $(PY) -m pytest tests/test_integration.py -m integration -q
 
-bolna-agent: ## create or update the Night Shift agent at Bolna (reads .env)
-	set -a; . ./.env; set +a; $(PY) scripts/bolna_agent.py
+demo-up: ## start NATS/OPA/API/Pathway/worker/simulator/console (DEMO_MODE=sim|live)
+	scripts/demo.sh up
+
+demo-status: ## integration health from the running API
+	scripts/demo.sh status
+
+demo-trigger: ## trigger the NetworkPolicy incident (sim: DEMO_SIMULATOR; live: demo/trigger.sh)
+	scripts/demo.sh trigger
+
+demo-reset: ## clear demo data, reset the simulator, restart Pathway
+	scripts/demo.sh reset
+
+demo-verify: ## run the browser journey against the running stack
+	NODE_PATH=$$(npm root -g) node e2e/journey.mjs
+
+demo-down: ## stop everything demo-up started
+	scripts/demo.sh down
+
+hackathon-verify: ## tests + build + (if running) journey -> .agent/verification-results.json
+	$(PY) scripts/hackathon_verify.py
 
 logs: ## follow the worker
 	kubectl -n beacon logs -f deploy/beacon-worker

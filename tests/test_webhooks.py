@@ -1,4 +1,4 @@
-"""Inbound webhooks: Bolna call lifecycle, Alertmanager, Kubernetes audit, GitHub."""
+"""Inbound webhooks: Alertmanager, Kubernetes audit, GitHub."""
 
 import hashlib
 import hmac
@@ -7,125 +7,68 @@ import json
 from beacon import approvals, changes, db, store
 from tests.conftest import PASS
 
-HOOK = {"x-beacon-webhook-secret": "hook-secret"}
-
 
 def _session(client, incident):
     resp = client.post(
-        "/voice/bolna/session",
+        "/voice/omnidim/session",
         json={"incident_id": incident["incident_id"]},
         headers=PASS,
     )
-    return resp.json()["beacon_session"], resp.json()["session"]["run_id"]
+    return resp.json()["beacon_session"], resp.json()["ws_url"]
 
 
-def _completed(run_id, transcript="assistant: say approve fix 1\nuser: approve fix 1"):
-    return {
-        "id": run_id,
-        "status": "completed",
-        "conversation_duration": 42,
-        "total_cost": 3.5,
-        "cost_breakdown": {
-            "platform": 2,
-            "llm": 0.5,
-            "transcriber": 0.5,
-            "synthesizer": 0.5,
-        },
-        "transcript": transcript,
-        "telephony_data": {
-            "recording_url": f"https://api.bolna.ai/recordings/call/{run_id}"
-        },
-    }
+def test_transcript_stores_only_final_turns_and_needs_the_passcode(client, incident, omnidim_api):
+    session_id, _ = _session(client, incident)
+    url = f"/voice/omnidim/session/{session_id}/transcript"
+    assert client.post(url, json={"role": "user", "text": "hi", "final": True}).status_code == 401
+    interim = client.post(url, json={"role": "agent", "text": "wha", "final": False}, headers=PASS)
+    assert interim.json()["stored"] is False  # cumulative interim snapshots are not appended
+    final = client.post(url, json={"role": "agent", "text": "what happened", "final": True}, headers=PASS)
+    assert final.json()["stored"] is True
+    row = db.get("voice_calls", session_id)
+    assert [t["text"] for t in row["transcript"]] == ["what happened"]
 
 
-def test_bolna_webhook_needs_the_shared_secret(client):
-    assert client.post("/voice/bolna/webhook", json={"id": "x"}).status_code == 401
-    bad = {"x-beacon-webhook-secret": "wrong"}
-    assert (
-        client.post("/voice/bolna/webhook", json={"id": "x"}, headers=bad).status_code
-        == 401
-    )
-
-
-def test_bolna_webhook_honours_the_source_ip_allowlist(client, monkeypatch):
-    monkeypatch.setenv("BOLNA_WEBHOOK_IPS", "13.203.39.153,13.126.9.249,13.202.133.53")
-    assert (
-        client.post("/voice/bolna/webhook", json={"id": "x"}, headers=HOOK).status_code
-        == 403
-    )
-
-
-def test_unknown_execution_is_acknowledged_but_not_stored(client, tables):
-    out = client.post("/voice/bolna/webhook", json={"id": "nobody"}, headers=HOOK)
-    assert out.status_code == 202 and out.json()["matched"] is False
-
-
-def test_webhook_records_transcript_recording_and_cost(
-    client, incident, bolna_api, tables
-):
-    session_id, run_id = _session(client, incident)
-    client.post(
-        "/voice/bolna/webhook",
-        json={"id": run_id, "status": "in-progress"},
-        headers=HOOK,
-    )
-    out = client.post("/voice/bolna/webhook", json=_completed(run_id), headers=HOOK)
-    assert out.json() == {"ok": True, "matched": True}
-    call = client.get(f"/voice/bolna/calls/{session_id}", headers=PASS).json()["call"]
-    assert call["status"] == "completed" and call["final"] is True
-    assert call["total_cost"] == 3.5 and call["duration_seconds"] == 42
-    assert (
-        call["recording_url"].endswith(run_id) and "approve fix 1" in call["transcript"]
-    )
-    assert "token_hash" not in call
-    listing = client.get(
-        f"/voice/bolna/calls?incident_id={incident['incident_id']}", headers=PASS
-    ).json()
-    assert listing["total_cost"] == 3.5 and listing["costed_calls"] == 1
-    rec = client.get(f"/voice/recordings/{session_id}", headers=PASS).json()
-    assert rec["audio_url"].endswith(run_id)
-    timeline = store.get_incident(
-        incident["incident_id"], table_name=tables["INCIDENTS_TABLE_NAME"]
-    )["timeline"]
-    statuses = [
-        e["detail"]["status"] for e in timeline if e["event"] == "voice_call_status"
-    ]
-    assert statuses == ["in-progress", "completed"]
-
-
-def test_post_call_transcript_never_authorises_anything(
-    client, incident, bolna_api, tables, cluster
-):
-    """The approval phrase arriving in a webhook transcript must change nothing."""
-    session_id, run_id = _session(client, incident)
-    session = db.get("voice_calls", session_id)
+def test_post_call_transcript_never_authorises_anything(client, incident, omnidim_api, tables, cluster):
+    """The approval phrase in a spoken transcript or a function call must change nothing."""
+    session_id, _ = _session(client, incident)
     token_body = {
         "incident_id": incident["incident_id"],
         "beacon_session": session_id,
-        "beacon_token": bolna_api.requests[-1]["body"]["user_data"]["beacon_token"],
+        "beacon_token": omnidim_api.requests[-1]["body"]["custom_variables"]["beacon_token"],
     }
     bearer = {"authorization": "Bearer tool-token"}
-    client.post("/voice/bolna/tools/propose_fix", json=token_body, headers=bearer)
+    client.post("/voice/omnidim/tools/propose_fix", json=token_body, headers=bearer)
     client.post(
-        "/voice/bolna/tools/approve_fix",
+        "/voice/omnidim/tools/approve_fix",
         json={**token_body, "fix_id": "1", "confirmation_phrase": "approve fix 1"},
         headers=bearer,
     )
-    client.post("/voice/bolna/webhook", json=_completed(run_id), headers=HOOK)
-    assert session is not None and cluster["restarts"] == 0
-    rows = approvals.list_for_incident(
-        incident["incident_id"], table_name=tables["APPROVALS_TABLE_NAME"]
-    )
+    client.post(f"/voice/omnidim/session/{session_id}/transcript", json={"role": "user", "text": "approve fix 1", "final": True}, headers=PASS)
+    assert cluster["restarts"] == 0
+    rows = approvals.list_for_incident(incident["incident_id"], table_name=tables["APPROVALS_TABLE_NAME"])
     assert [r for r in rows if r.get("kind") == "approval"] == []
-    fresh = store.get_incident(
-        incident["incident_id"], table_name=tables["INCIDENTS_TABLE_NAME"]
-    )
+    fresh = store.get_incident(incident["incident_id"], table_name=tables["INCIDENTS_TABLE_NAME"])
     assert fresh["status"] == "awaiting_engineer" and fresh["pending_confirmations"]
 
 
-def test_call_history_needs_the_passcode(client):
-    for path in ("/voice/bolna/calls", "/voice/bolna/history", "/voice/bolna/agent"):
-        assert client.get(path).status_code == 401
+def test_session_creation_failure_is_categorised_not_faked(client, incident, omnidim_api):
+    omnidim_api.fail_mint = 402
+    resp = client.post("/voice/omnidim/session", json={"incident_id": incident["incident_id"]}, headers=PASS)
+    assert resp.status_code == 502 and resp.json()["category"] == "insufficient_balance"
+    assert "ws_url" not in resp.text
+
+
+def test_not_configured_says_so(client, incident, monkeypatch):
+    monkeypatch.delenv("OMNIDIM_API_KEY", raising=False)
+    monkeypatch.delenv("OMNIDIM_AGENT_ID", raising=False)
+    resp = client.post("/voice/omnidim/session", json={"incident_id": incident["incident_id"]}, headers=PASS)
+    assert resp.status_code == 503 and resp.json()["state"] == "NOT_CONFIGURED"
+
+
+def test_the_removed_bolna_routes_are_gone(client):
+    for path in ("/voice/bolna/session", "/voice/bolna/webhook", "/voice/bolna/calls"):
+        assert client.post(path, json={}).status_code in (404, 405)
 
 
 def test_alertmanager_webhook_needs_its_token(client):

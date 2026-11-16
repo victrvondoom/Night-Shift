@@ -115,7 +115,7 @@ export function Safety({ safety }: { safety: SafetyData | null }) {
     <div className="stack">
       <Marquee />
       <div className="banner">
-        Consent is decided here, against the exact phrase you type — never against the argument a model wrote on a <b>Bolna</b> call. Everything below bounds what that consent is allowed to reach.
+        Consent is decided here, against the exact phrase you type — never against the argument a model wrote on a <b>OmniDimension</b> call. Everything below bounds what that consent is allowed to reach.
       </div>
       <div className="panel">
         <div className="panel-h">

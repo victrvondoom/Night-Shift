@@ -1,0 +1,71 @@
+{
+  "generated_at": "2026-11-16T17:56:46.235740+00:00",
+  "results": [
+    {
+      "check": "ruff",
+      "kind": "static",
+      "status": "PASS",
+      "detail": "All checks passed!"
+    },
+    {
+      "check": "pytest (unit, contract fakes, Pathway over NATS)",
+      "kind": "contract",
+      "status": "PASS",
+      "detail": "178 passed, 6 skipped in 26.29s"
+    },
+    {
+      "check": "web typecheck + build",
+      "kind": "static",
+      "status": "PASS",
+      "detail": "\u2713 built in 1.38s"
+    },
+    {
+      "check": "browser journey (DEMO_SIMULATOR)",
+      "kind": "e2e",
+      "status": "PASS",
+      "detail": "PASS  report generated from persisted data"
+    },
+    {
+      "check": "live bifrost",
+      "kind": "live",
+      "status": "NOT_CONFIGURED",
+      "detail": "credentials absent"
+    },
+    {
+      "check": "live tavily",
+      "kind": "live",
+      "status": "NOT_CONFIGURED",
+      "detail": "credentials absent"
+    },
+    {
+      "check": "live omnidimension",
+      "kind": "live",
+      "status": "NOT_CONFIGURED",
+      "detail": "credentials absent"
+    },
+    {
+      "check": "service nats",
+      "kind": "live",
+      "status": "PASS",
+      "detail": "JetStream stream BEACON reachable"
+    },
+    {
+      "check": "service pathway",
+      "kind": "live",
+      "status": "PASS",
+      "detail": "pathway 0.33.1 \u00b7 rule netpol_change_then_dependency_symptoms.v1 \u00b7 last event 2026-11-16T17:56:23.054959+00:00"
+    },
+    {
+      "check": "service opa",
+      "kind": "live",
+      "status": "PASS",
+      "detail": "policy engine /health"
+    },
+    {
+      "check": "service postgresql",
+      "kind": "live",
+      "status": "PASS",
+      "detail": "SELECT 1"
+    }
+  ]
+}

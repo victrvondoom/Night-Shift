@@ -17,7 +17,7 @@ allowed_actions := {
 protected_namespaces := {"kube-system", "kube-public", "kube-node-lease", "beacon"}
 
 # Evidence kinds that prove a human, not a model, authorised the change.
-verified_evidence := {"typed_console", "typed_telegram", "bolna_transcriber_log", "contract"}
+verified_evidence := {"typed_console", "typed_telegram", "contract"}
 
 deny contains msg if {
 	not input.action in allowed_actions

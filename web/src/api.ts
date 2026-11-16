@@ -76,7 +76,7 @@ export function makeApi(config: Config, passcode: () => string) {
         { method: "POST", body: JSON.stringify({ incident_id: incidentId }) },
         passcode(),
       ),
-    /** What Night Shift can show about how the consent phrase was captured. Bolna
+    /** What Night Shift can show about how the consent phrase was captured. OmniDimension
      *  reports no word confidence, so nothing is scored: the reply says so. */
     sessionAttest: (sessionId: string, incidentId: string) =>
       request<{ ok: boolean; checks: Array<{ phrase: string; ok: boolean; confidence: number | null; weakest_word?: string | null; why?: string; one_voice?: { ok: boolean | null; voices: string[] } }>; problems: string[]; typed?: Array<{ quote?: string; event?: string }>; note?: string }>(

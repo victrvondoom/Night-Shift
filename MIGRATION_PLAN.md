@@ -1,4 +1,4 @@
-# Migration plan: off AWS, AssemblyAI to Bolna
+# Migration plan: off AWS, AssemblyAI to OmniDimension
 
 This records what the migration changed and why. The product, the console and
 the safety model are the same; the infrastructure and voice provider underneath
@@ -35,23 +35,23 @@ are not.
 | SNS | Slack, Telegram, PagerDuty | `channels.py`, `notifier.py` |
 | Security-group and ECS actions | `networkpolicy.restore_ingress` / `revoke_ingress`, `deployment.restart`, `deployment.rollback` with server-side dry run | `remediation/` |
 | CloudWatch verification | Prometheus alert state + expression, Kubernetes post-condition, HTTP health check | `remediation/verify.py` |
-| AssemblyAI Voice Agent | Bolna Web Call SDK + custom functions + webhooks | `bolna.py`, `voice_turn.py`, `web/src/voice/bolna.ts` |
-| Amazon Connect / Twilio bridge | Bolna telephony (`POST /call`) | `caller.py` |
+| AssemblyAI Voice Agent | OmniDimension Web Call SDK + custom functions + webhooks | `omnidim.py`, `voice_turn.py`, `web/src/voice/omnidim.ts` |
+| Amazon Connect / Twilio bridge | OmniDimension telephony (`POST /call`) | `caller.py` |
 | Fargate demo | Demo app + NetworkPolicy on local Kubernetes | `demo/`, `deploy/k8s/demo/` |
 
 ## The one behaviour that changed: voice consent
 
 The original checked the approval phrase against a transcript the browser
-received from AssemblyAI, with word confidence. Bolna does not give that:
+received from AssemblyAI, with word confidence. OmniDimension does not give that:
 
-- The Web Call SDK (`@bolna/web-call` 3.0.1) exposes call state, agent volume,
+- The Web Call SDK (`@omnidim/web-call` 3.0.1) exposes call state, agent volume,
   errors and the execution id. It has no transcript, speaker or interruption events.
 - A custom function call carries only the arguments the agent's LLM wrote.
 - The transcript arrives after the call, through the execution API or webhook.
 
-So a Bolna function call cannot prove the engineer said anything. Night Shift treats
+So a OmniDimension function call cannot prove the engineer said anything. Night Shift treats
 it as a request: `approve_fix`, `undo_fix`, `grant_sleep_contract` and
-`open_fix_pr` arriving from Bolna are validated, recorded and **held**; the
+`open_fix_pr` arriving from OmniDimension are validated, recorded and **held**; the
 proposal stays pending. The change runs only when the engineer types the exact
 phrase in the passcode-authenticated console (or the allowlisted Telegram
 chat). Webhook transcripts are stored and never authorise anything. No

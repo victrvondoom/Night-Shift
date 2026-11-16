@@ -61,8 +61,8 @@ def test_execute_needs_a_verified_unused_approval():
     ]
 
 
-def test_a_bolna_function_call_is_not_verified_consent():
-    voice = {**APPROVAL, "attestation": {"evidence": "bolna_llm_function_call"}}
+def test_an_omnidim_function_call_is_not_verified_consent():
+    voice = {**APPROVAL, "attestation": {"evidence": "omnidim_llm_function_call"}}
     ok, why = policy.evaluate("execute", "deployment.restart", RESTART, approval=voice)
     assert not ok and any("not verified human consent" in w for w in why)
 

@@ -4,7 +4,7 @@ from functools import cache
 from importlib.resources import files
 from typing import TYPE_CHECKING, Any
 
-import litellm
+from beacon.llm import gateway
 
 if TYPE_CHECKING:
     from beacon.config import NightShiftConfig
@@ -37,7 +37,7 @@ def triage(
         f"--- TRIGGER CONTEXT ---\n{trigger_context}\n\n--- LOG DATA ---\n{log_content}"
     )
 
-    response: Any = litellm.completion(
+    response: Any = gateway.completion(
         model=config.litellm_model,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -69,7 +69,7 @@ def _structured_tail(analysis: str, config: NightShiftConfig) -> str:
     the action against the allowlist before anything can be proposed.
     """
     try:
-        response: Any = litellm.completion(
+        response: Any = gateway.completion(
             model=config.litellm_model,
             messages=[
                 {"role": "system", "content": _JSON_INSTRUCTIONS},

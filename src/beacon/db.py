@@ -15,7 +15,6 @@ import re
 import threading
 from typing import Any
 
-import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 

@@ -1,7 +1,7 @@
 /** A slow, seamless ticker: the track is duplicated so translateX(-50%) loops without a seam. */
 /* What this actually runs on, in the order that matters. */
 export const AWS_SERVICES = [
-  "Bolna Voice AI",
+  "OmniDimension Voice",
   "Kubernetes",
   "Prometheus",
   "Alertmanager",

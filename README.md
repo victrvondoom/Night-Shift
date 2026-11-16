@@ -1,12 +1,15 @@
 # Night Shift
 
+> **Hackathon build: the one-incident proof.** A NetworkPolicy change breaks app→DB connectivity; Night Shift correlates change and symptoms with **Pathway** over **NATS**, researches the mechanism with **Tavily**, explains it through **Bifrost**, briefs you with **OmniDimension**, and fixes it only after your typed approval, then verifies recovery independently. Start here: [`docs/HACKATHON.md`](docs/HACKATHON.md) (`make demo-up && make demo-trigger`, open `#workspace`).
+
+
 <p align="center">
   <img src="docs/assets/nightshift-hero.jpg" alt="Night Shift Hero Console" width="100%" />
 </p>
 
 > ### 🌙 The 2 AM page, fixed with your voice.
 > **Night Shift is a voice assistant for engineers on call.**  
-> When a system breaks at 2 AM, you talk to it through Bolna voice AI. It explains what went wrong, suggests one safe fix, and waits for your clear approval before touching anything. Then it applies the fix, checks that everything truly recovered, and writes the report. **Interrupt it and it stops.**
+> When a system breaks at 2 AM, you talk to it through OmniDimension voice AI. It explains what went wrong, suggests one safe fix, and waits for your clear approval before touching anything. Then it applies the fix, checks that everything truly recovered, and writes the report. **Interrupt it and it stops.**
 
 <p align="center">
   <img src="docs/assets/nightshift-metrics.png" alt="Night Shift Analytics and Recovery Metrics" width="100%" />
@@ -20,7 +23,7 @@ At 2:00 AM, sleep inertia degrades cognitive function by up to 50%. Reading thro
 
 **Night Shift turns incident triage into a calm, guided voice conversation:**
 
-1. **You wake up and talk.** Connect directly from your browser or phone via real-time duplex voice powered by Bolna Voice AI.
+1. **You wake up and talk.** Connect directly from your browser or phone via real-time duplex voice powered by OmniDimension Voice AI.
 2. **Deterministic triage first.** Night Shift correlates Prometheus alerts, Kubernetes audit events, Loki logs, and cluster change ledgers.
 3. **One safe fix proposed.** It never hallucinates or generates freeform shell scripts. It selects exactly one allowlisted remediation, validates it against Open Policy Agent (OPA), and runs a server-side dry run.
 4. **Strict human consent.** The agent reads back the exact action and blast radius. It requires an unequivocal approval (`approve fix 1`). A spoken sentence queues the intent; a typed confirmation seals the cryptographic consent certificate.
@@ -56,14 +59,14 @@ flowchart TD
         API --> VAULT
     end
 
-    subgraph VoiceAI["Bolna Voice AI Platform"]
-        BOLNA["Bolna Voice Agent - WebRTC and Telephony"]
+    subgraph VoiceAI["OmniDimension Voice AI Platform"]
+        OMNIDIM["OmniDimension Voice Agent - WebRTC and Telephony"]
         STT["Deepgram STT"]
         LLM["Deterministic Tool LLM"]
         TTS["ElevenLabs TTS"]
-        BOLNA --- STT
-        BOLNA --- LLM
-        BOLNA --- TTS
+        OMNIDIM --- STT
+        OMNIDIM --- LLM
+        OMNIDIM --- TTS
     end
 
     subgraph UI["Engineer Interface"]
@@ -79,8 +82,8 @@ flowchart TD
     end
 
     %% Connections
-    BROWSER <-->|"WebRTC Stream"| BOLNA
-    BOLNA <-->|"Tool Calls /voice/bolna/tools/*"| API
+    BROWSER <-->|"WebRTC Stream"| OMNIDIM
+    OMNIDIM <-->|"Tool Calls /voice/omnidim/tools/*"| API
     BROWSER <-->|"REST & Polling"| API
     API -->|"Initiate Workflow"| WORKER
     WORKER -->|"Evaluate Policy"| OPA
@@ -94,8 +97,8 @@ flowchart TD
 
 | Domain | Technology | Purpose |
 |---|---|---|
-| **Voice Interface** | **Bolna Voice AI** | Full-duplex WebRTC streaming, custom tool function calling, low-latency STT/TTS, and live interruption detection. |
-| **API & Ingestion** | **FastAPI** (`beacon.server`) | Ingestion of Prometheus alerts, Kubernetes audit logs, Bolna webhooks, and REST console endpoints. |
+| **Voice Interface** | **OmniDimension Voice AI** | Full-duplex WebRTC streaming, custom tool function calling, low-latency STT/TTS, and live interruption detection. |
+| **API & Ingestion** | **FastAPI** (`beacon.server`) | Ingestion of Prometheus alerts, Kubernetes audit logs, OmniDimension webhooks, and REST console endpoints. |
 | **Execution Engine** | **Temporal** + Python Worker | Durable, retryable remediation workflows that guarantee idempotent execution and multi-stage verification. |
 | **Policy & Safety** | **Open Policy Agent (OPA)** | Evaluates `policy/remediation.rego` before dry runs and executions. Zero approval from OPA = zero cluster mutation. |
 | **Event Bus & Storage** | **NATS JetStream** + **PostgreSQL** | High-throughput event delivery and persistent ledger tracking cluster changes and historical approvals. |
@@ -113,7 +116,7 @@ Here is how an incident unfolds from the moment a pod crashes to the signed reco
 sequenceDiagram
     autonumber
     actor Engineer as Engineer (Browser or Phone)
-    participant Bolna as Bolna Voice AI
+    participant OmniDimension as OmniDimension Voice AI
     participant API as Night Shift API
     participant Worker as Temporal Orchestrator
     participant OPA as Open Policy Agent
@@ -125,19 +128,19 @@ sequenceDiagram
     API->>Worker: Triage alert and correlate with K8s Audit Ledger
     Worker->>Worker: Formulate deterministic RCA and select 1 Allowlisted Action
 
-    Note over Engineer,Bolna: 02:14:30 AM - Voice Session Initiated
-    Engineer->>Bolna: "Night Shift, what happened?"
-    Bolna->>API: POST /voice/bolna/tools/get_incident_summary
-    API-->>Bolna: "Database connection dropped. Ingress rule was deleted by user admin."
-    Bolna-->>Engineer: Speaks root cause and proposes single fix: "Restore missing ingress rule."
+    Note over Engineer,OmniDimension: 02:14:30 AM - Voice Session Initiated
+    Engineer->>OmniDimension: "Night Shift, what happened?"
+    OmniDimension->>API: POST /voice/omnidim/tools/get_incident_summary
+    API-->>OmniDimension: "Database connection dropped. Ingress rule was deleted by user admin."
+    OmniDimension-->>Engineer: Speaks root cause and proposes single fix: "Restore missing ingress rule."
     
     alt Engineer Interrupts
-        Engineer->>Bolna: "Wait, stop!"
-        Bolna->>API: POST /voice/bolna/tools/cancel_proposal
+        Engineer->>OmniDimension: "Wait, stop!"
+        OmniDimension->>API: POST /voice/omnidim/tools/cancel_proposal
         API-->>Engineer: Proposal withdrawn immediately. Zero changes made.
     else Engineer Approves
-        Engineer->>Bolna: "Approve fix 1"
-        Bolna->>API: POST /voice/bolna/tools/request_approval
+        Engineer->>OmniDimension: "Approve fix 1"
+        OmniDimension->>API: POST /voice/omnidim/tools/request_approval
         Note over API: Proposal held. Spoken voice alone cannot mutate production!
         Engineer->>API: Types exact confirmation phrase into Console
         API->>Worker: Trigger Remediation Workflow
@@ -154,8 +157,8 @@ sequenceDiagram
         end
 
         Worker->>API: Issue Consent Certificate and Postmortem
-        API-->>Bolna: "Cluster fully verified. 39s MTTR. Go back to sleep."
-        Bolna-->>Engineer: Speaks confirmation. Call ends.
+        API-->>OmniDimension: "Cluster fully verified. 39s MTTR. Go back to sleep."
+        OmniDimension-->>Engineer: Speaks confirmation. Call ends.
     end
 ```
 
@@ -221,7 +224,7 @@ stateDiagram-v2
 - **kubectl**
 - **Python 3.12+** & **uv** (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - **Node.js 20+** & **npm**
-- **Bolna Account**: API key from [platform.bolna.ai](https://platform.bolna.ai)
+- **OmniDimension Account**: API key from [platform.omnidim.ai](https://platform.omnidim.ai)
 
 ---
 
@@ -240,8 +243,8 @@ cp .env.example .env
 Edit `.env` to configure your tokens and secrets:
 ```env
 PASSCODE=nightshift-secret
-BOLNA_API_KEY=your_bolna_api_key
-BOLNA_PUBLIC_URL=https://your-domain-or-tunnel.ngrok.app
+OMNIDIM_API_KEY=your_omnidim_api_key
+PUBLIC_API_URL=https://your-domain-or-tunnel.ngrok.app
 ```
 
 #### 3. Install Dependencies & Build
@@ -263,26 +266,11 @@ make up
 
 ---
 
-## 🎙️ Bolna Voice AI Setup
+## 🎙️ OmniDimension voice setup
 
-1. **Sign up at [platform.bolna.ai](https://platform.bolna.ai)** and copy your API Key into `.env` (`BOLNA_API_KEY`).
-2. **Configure Voice Providers** in Bolna Settings:
-   - Speech-to-Text: Deepgram
-   - LLM: OpenAI (`gpt-4o-mini`)
-   - Text-to-Speech: ElevenLabs
-3. **Expose your local endpoint** via tunnel (Cloudflare Tunnel or ngrok) to port `30080`:
-   ```bash
-   ngrok http 30080
-   ```
-   Set `BOLNA_PUBLIC_URL=https://<your-subdomain>.ngrok.app` in `.env`.
-4. **Register the Voice Agent with Bolna**:
-   ```bash
-   make bolna-agent
-   ```
-   *Registers all 9 custom diagnostic and consent tools pointing to `/voice/bolna/tools/<tool_name>`.*
-5. Copy the generated `BOLNA_AGENT_ID` into your `.env` and run `make up`.
-
----
+1. Create an agent in the [OmniDimension dashboard](https://docs.omnidim.io); use the prompt from `beacon.voice_brief.omnidim_prompt()` and add custom API tools pointing at `POST <public-api>/voice/omnidim/tools/<name>` with `Authorization: Bearer $OMNIDIM_TOOL_TOKEN` (read-only tools + `propose_fix`; approval is never a voice action).
+2. Put `OMNIDIM_API_KEY` and the integer `OMNIDIM_AGENT_ID` in `.env`.
+3. Open **Incident** in the console and press *Start voice briefing*. The backend creates the session (`POST /api/v1/sessions/create`) and returns only the single-use `ws_url`; the browser uses `@omnidim-ai/client`.
 
 ## 🧪 Interactive Live Demos
 
@@ -332,15 +320,15 @@ npm run dev -- --host 127.0.0.1 --port 5173
 
 ```
 ├── src/beacon/              # Core Python backend package
-│   ├── server.py            # FastAPI endpoints (Alerts, Bolna tools, Webhooks, REST)
+│   ├── server.py            # FastAPI endpoints (Alerts, OmniDimension tools, Webhooks, REST)
 │   ├── worker.py            # Temporal workflow activities & workers
-│   ├── bolna/               # Bolna Voice AI SDK & custom agent definitions
+│   ├── omnidim/               # OmniDimension Voice AI SDK & custom agent definitions
 │   ├── remediation/         # Strict action allowlist & dry-run runners
 │   ├── triage/              # Prometheus alert & Loki log correlation engines
 │   └── store/               # PostgreSQL ledgers & MinIO object storage
 ├── web/                     # React + Vite web console ("Night Board")
 │   ├── src/components/      # Duplex voice visualizer, Night Board HUD, Audit view
-│   └── src/voice/           # Bolna Web Call SDK integration & audio monitor
+│   └── src/voice/           # OmniDimension Web Call SDK integration & audio monitor
 ├── policy/                  # Open Policy Agent (remediation.rego)
 ├── deploy/                  # Production & local k3d Kubernetes manifests
 │   ├── k8s/                 # Platform services, RBAC, Vault, MinIO manifests

@@ -206,7 +206,7 @@ export function JudgeBody({ hasPasscode }: { hasPasscode: boolean }) {
         </div>
         <div>
           <b>Why the words matter.</b> They are the audit artifact: what unlocked the change and which channel it
-          came from. On a <b>Bolna</b> call the agent can ask for an approval, but a model-written request is not
+          came from. On a <b>OmniDimension</b> call the agent can ask for an approval, but a model-written request is not
           your consent: Night Shift holds it, and nothing reaches the cluster until you type the exact phrase.
         </div>
         <ol className="rules">
@@ -215,7 +215,7 @@ export function JudgeBody({ hasPasscode }: { hasPasscode: boolean }) {
             Click any <span className="chip">E2</span> chip: every sentence is pinned to evidence.
           </li>
           <li>
-            Open <b>Audit</b> to see every approval with the words behind it, where they came from, and the Bolna
+            Open <b>Audit</b> to see every approval with the words behind it, where they came from, and the OmniDimension
             call that led up to it.
           </li>
           <li>

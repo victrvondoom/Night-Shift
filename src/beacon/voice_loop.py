@@ -1,7 +1,7 @@
 """Fallback voice engine: a plain litellm tool-calling loop.
 
 The typed-console agent: a local model on Ollama (through litellm) calling the
-same tools with the same ``TOOL_SCHEMAS`` the Bolna voice agent uses.
+same tools with the same ``TOOL_SCHEMAS`` the OmniDimension voice agent uses.
 """
 
 from __future__ import annotations
@@ -70,11 +70,11 @@ class LiteLLMAgent:
         ]
 
     def __call__(self, text: str) -> str:
-        import litellm
+        from beacon.llm import gateway
 
         self.messages.append({"role": "user", "content": [{"text": text}]})
         for _ in range(_MAX_ITERATIONS):
-            response: Any = litellm.completion(
+            response: Any = gateway.completion(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.system_prompt},

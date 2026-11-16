@@ -11,8 +11,7 @@ import { Marquee } from "./components/Marquee";
 import { Contracts } from "./components/Contracts";
 import { Safety } from "./components/Safety";
 import { Talk } from "./components/Talk";
-import { TalkDuplex } from "./components/TalkDuplex";
-import { chooseBackend } from "./voice/select";
+import { Workspace } from "./workspace/Workspace";
 import { useClock, useLocalState, usePoll } from "./hooks";
 import { useNavIndicator, useReveal, useScrolled, useCursorMotion } from "./motion";
 import { loadReplay, type ReplayBundle } from "./replay";
@@ -20,9 +19,9 @@ import { computeAnalytics } from "./analytics";
 import type { Analytics as AnalyticsData, AuditRow, Contract, Health, Incident, MorningReport, Safety as SafetyData, Tally } from "./types";
 import { chooseStt } from "./voice/stt";
 
-type Route = "home" | "board" | "analytics" | "contracts" | "audit" | "report" | "safety" | "postmortem" | "notfound";
-const ROUTES = ["home", "board", "analytics", "contracts", "audit", "report", "safety"] as const;
-const KEY_ROUTES: Record<string, Route> = { h: "home", b: "board", a: "analytics", c: "contracts", u: "audit", p: "report", s: "safety" };
+type Route = "home" | "workspace" | "board" | "analytics" | "contracts" | "audit" | "report" | "safety" | "postmortem" | "notfound";
+const ROUTES = ["home", "workspace", "board", "analytics", "contracts", "audit", "report", "safety"] as const;
+const KEY_ROUTES: Record<string, Route> = { h: "home", w: "workspace", b: "board", a: "analytics", c: "contracts", u: "audit", p: "report", s: "safety" };
 
 /** "Run the night" (local mode): the engineer's lines for the first incident. */
 const NIGHT_SCRIPT = ["can you fix it", "approve fix 1", "yes", "grant contract for seven days"];
@@ -37,6 +36,7 @@ const NIGHT_LABEL: Record<Exclude<Night, null>, string> = {
 function parseHash(): { route: Route; deepId: string | null } {
   const h = window.location.hash.replace("#", "");
   const [head, ...rest] = h.split("/");
+  if (head === "workspace") return { route: "workspace", deepId: rest[0] ? decodeURIComponent(rest[0]) : null };
   if (head === "board") return { route: "board", deepId: rest[0] ? decodeURIComponent(rest[0]) : null };
   if (head === "postmortem" && rest[0]) return { route: "postmortem", deepId: decodeURIComponent(rest[0]) };
   if ((ROUTES as readonly string[]).includes(head)) return { route: head as Route, deepId: null };
@@ -55,12 +55,13 @@ function useRoute(): [Route, string | null] {
   return [state.route, state.deepId];
 }
 
+const trimSlashApi = (u: string) => (u.endsWith("/") ? u.slice(0, -1) : u);
+
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [replay, setReplay] = useState<ReplayBundle | null>(null);
   const [passcode, setPasscode] = useLocalState("beacon.passcode", "");
-  // The live Bolna call or the push-to-talk console, per browser.
-  const [voicePick, setVoicePick] = useLocalState("beacon.voiceBackend", "");
+  // The live OmniDimension call or the push-to-talk console, per browser.
   const [route, deepId] = useRoute();
   const [filter, setFilter] = useState<"all" | "needs" | "progress" | "resolved" | "contract">("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -142,6 +143,7 @@ export default function App() {
     const titles: Record<Route, string> = {
       home: "Night Shift — the 2 AM page, fixed with your voice",
       board: "Night Board · Night Shift",
+      workspace: "Incident workspace · Night Shift",
       analytics: "Analytics · Night Shift",
       contracts: "Sleep Contracts · Night Shift",
       safety: "Safety · Night Shift",
@@ -335,16 +337,16 @@ export default function App() {
       ) : freshDeployment ? (
         <Announce text="No incidents tonight · view the archived night" onClick={() => void startReplay()} />
       ) : config ? (
-        <Announce text={`Voice by Bolna · running on Kubernetes (${config.region})${healthQ.data?.version ? ` · v${healthQ.data.version}` : ""}`} href="#safety" />
+        <Announce text={`Voice by OmniDimension · running on Kubernetes (${config.region})${healthQ.data?.version ? ` · v${healthQ.data.version}` : ""}`} href="#safety" />
       ) : null}
       <header className={`topbar${menuOpen ? " open" : ""}`} ref={topbarRef}>
         <a className="brand" href="#home" aria-label="Night Shift, home">
           <span className="dot" />
           Night Shift
         </a>
-        <span className="aai" title="Speech, turn detection, the LLM and TTS run on a Bolna call; every change still needs your typed phrase">
+        <span className="aai" title="Speech, turn detection, the LLM and TTS run on a OmniDimension call; every change still needs your typed phrase">
           <span className="pulse" aria-hidden="true" />
-          Voice by Bolna<span className="long"> · live call</span>
+          Voice by OmniDimension<span className="long"> · live session</span>
         </span>
         <button type="button" className={`burger${menuOpen ? " x" : ""}`} aria-label={menuOpen ? "Close menu" : "Open menu"} aria-expanded={menuOpen} aria-controls="site-nav" onClick={() => setMenuOpen((o) => !o)}>
           <span />
@@ -354,6 +356,9 @@ export default function App() {
         <nav className="nav" id="site-nav" aria-label="Sections" ref={navRef}>
           <a href="#home" className={route === "home" ? "active" : ""} aria-current={route === "home" ? "page" : undefined}>
             Home
+          </a>
+          <a href="#workspace" className={route === "workspace" ? "active" : ""} aria-current={route === "workspace" ? "page" : undefined}>
+            Incident
           </a>
           <a href="#board" className={route === "board" ? "active" : ""} aria-current={route === "board" ? "page" : undefined}>
             Night Board
@@ -490,39 +495,7 @@ export default function App() {
           </section>
           {current ? (
             <section>
-              {api && config && !replay && chooseBackend(config) === "bolna" ? (
-                config.cascadeEnabled === false ? (
-                  // One voice path, named.
-                  <div className="backend-badge">
-                    <span className="pulse" aria-hidden="true" />
-                    Bolna · live call
-                    <span className="sub"> · speech, turn detection, tools and TTS on one call</span>
-                  </div>
-                ) : (
-                <div className="backend-switch" role="tablist" aria-label="Voice backend">
-                  <button role="tab" aria-selected={voicePick !== "console"} className={`seg${voicePick !== "console" ? " on" : ""}`} onClick={() => setVoicePick("bolna")}>
-                    Bolna · live call
-                  </button>
-                  <button role="tab" aria-selected={voicePick === "console"} className={`seg${voicePick === "console" ? " on" : ""}`} onClick={() => setVoicePick("console")}>
-                    Console · push to talk
-                  </button>
-                </div>
-                )
-              ) : null}
-              {api && config && !replay && chooseBackend(config) === "bolna" && voicePick !== "console" ? (
-                <TalkDuplex
-                  key={`duplex-${current.incident_id}`}
-                  api={api}
-                  config={config}
-                  backend="bolna"
-                  incident={current}
-                  stt={stt}
-                  passcode={() => passcode}
-                  onIncident={onIncident}
-                  series={null}
-                />
-              ) : (
-                <Talk
+              <Talk
                   key={current.incident_id}
                   api={api}
                   incident={current}
@@ -534,9 +507,12 @@ export default function App() {
                   script={night === "first" ? NIGHT_SCRIPT : undefined}
                   onScriptDone={onNightScriptDone}
                 />
-              )}
             </section>
           ) : null}
+        </main>
+      ) : route === "workspace" ? (
+        <main key="workspace" className="main route-in">
+          {config ? <Workspace base={trimSlashApi(config.dashboardUrl)} voiceBase={trimSlashApi(config.voiceUrl)} passcode={passcode} setPasscode={setPasscode} incidentId={deepId} /> : null}
         </main>
       ) : route === "analytics" ? (
         <main key="analytics" className="main route-in">

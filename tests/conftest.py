@@ -13,12 +13,12 @@ os.environ.setdefault(
     "DATABASE_URL", "postgresql://beacon:beacon@localhost:5433/beacon"
 )
 os.environ.setdefault("OPA_URL", "http://localhost:8281")
+os.environ["NS_HEALTH_TABLE"] = "t_ns_integration_health"
 os.environ["REMEDIATION_MODE"] = "inline"
 os.environ["VERIFY_WAIT_SECONDS"] = "0"
 os.environ["VERIFY_MAX_ATTEMPTS"] = "2"
 os.environ["PASSCODE"] = "test-pass"
-os.environ["BOLNA_TOOL_TOKEN"] = "tool-token"
-os.environ["BOLNA_WEBHOOK_SECRET"] = "hook-secret"
+os.environ["OMNIDIM_TOOL_TOKEN"] = "tool-token"
 os.environ["ALERT_WEBHOOK_TOKEN"] = "alert-token"
 os.environ["AUDIT_WEBHOOK_TOKEN"] = "audit-token"
 os.environ["GITHUB_WEBHOOK_SECRET"] = "gh-secret"
@@ -295,11 +295,11 @@ def _close_pool() -> Any:
     db.reset()
 
 
-class FakeBolna:
-    """A local HTTP server speaking the Bolna endpoints Night Shift calls.
+class FakeOmniDim:
+    """A local HTTP server speaking OmniDimension's create-session endpoint.
 
-    The real API needs an account and a public callback URL, so the client is
-    exercised against this instead; requests are recorded for assertions.
+    Real sessions need an account and consume voice minutes, so the adapter is
+    exercised against this contract fake (a MOCK: it never counts as live verification).
     """
 
     def __init__(self) -> None:
@@ -308,7 +308,6 @@ class FakeBolna:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         self.requests: list[dict[str, Any]] = []
-        self.executions: dict[str, dict[str, Any]] = {}
         self.fail_mint: int | None = None
         outer = self
 
@@ -320,63 +319,18 @@ class FakeBolna:
                 self.end_headers()
                 self.wfile.write(raw)
 
-            def _handle(self, method: str) -> None:
+            def do_POST(self) -> None:  # noqa: N802
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}") if length else {}
-                outer.requests.append(
-                    {
-                        "method": method,
-                        "path": self.path,
-                        "auth": self.headers.get("Authorization"),
-                        "body": body,
-                    }
-                )
-                if self.headers.get("Authorization") != "Bearer bn-test-key":
-                    return self._reply(401, {"message": "Access denied"})
-                if self.path == "/web-call/session" and method == "POST":
+                outer.requests.append({"path": self.path, "auth": self.headers.get("Authorization"), "body": body})
+                if self.headers.get("Authorization") != "Bearer od-test-key":
+                    return self._reply(401, {"message": "unauthorised"})
+                if self.path == "/api/v1/sessions/create":
                     if outer.fail_mint:
-                        return self._reply(outer.fail_mint, {"message": "at capacity"})
-                    run_id = f"run-{uuid.uuid4().hex[:12]}"
-                    outer.executions[run_id] = {"id": run_id, "status": "in-progress"}
-                    return self._reply(
-                        200,
-                        {
-                            "run_id": run_id,
-                            "agent_id": body.get("agent_id"),
-                            "sip_username": "u",
-                            "sip_password": "p",
-                            "sip_domain": "d",
-                            "wss_url": "wss://x",
-                            "sip_register": False,
-                            "expires_in": 120,
-                            "ice_servers": [],
-                        },
-                    )
-                if self.path.startswith("/executions/") and method == "GET":
-                    found = outer.executions.get(self.path.split("/")[2])
-                    return self._reply(
-                        200 if found else 404, found or {"message": "nf"}
-                    )
-                if self.path == "/v2/agent" and method == "POST":
-                    return self._reply(
-                        201, {"agent_id": "agent-new", "state": "created"}
-                    )
-                if self.path.startswith("/v2/agent/") and method == "GET":
-                    return self._reply(
-                        200,
-                        {
-                            "agent_name": "Night Shift on-call",
-                            "webhook_url": "https://x/voice/bolna/webhook?secret=s",
-                            "tools_params": {"propose_fix": {"api_token": "Bearer t"}},
-                        },
-                    )
+                        return self._reply(outer.fail_mint, {"message": "limit"})
+                    token = f"sess_{uuid.uuid4().hex[:20]}"
+                    return self._reply(201, {"session_id": 4521, "token": token, "expires_at": "2026-01-01T00:15:00Z", "ws_url": f"wss://live.example.test/chat/start_voice_chat?request_token={token}"})
                 return self._reply(404, {"message": "not found"})
-
-            def do_GET(self) -> None:  # noqa: N802
-                self._handle("GET")
-
-            def do_POST(self) -> None:  # noqa: N802
-                self._handle("POST")
 
             def log_message(self, *args: Any) -> None:
                 pass
@@ -390,11 +344,11 @@ class FakeBolna:
 
 
 @pytest.fixture()
-def bolna_api(monkeypatch: pytest.MonkeyPatch) -> Any:
-    fake = FakeBolna()
-    monkeypatch.setenv("BOLNA_API_BASE", fake.url)
-    monkeypatch.setenv("BOLNA_API_KEY", "bn-test-key")
-    monkeypatch.setenv("BOLNA_AGENT_ID", "agent-1")
+def omnidim_api(monkeypatch: pytest.MonkeyPatch) -> Any:
+    fake = FakeOmniDim()
+    monkeypatch.setenv("OMNIDIM_API_BASE", fake.url)
+    monkeypatch.setenv("OMNIDIM_API_KEY", "od-test-key")
+    monkeypatch.setenv("OMNIDIM_AGENT_ID", "158910")
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     yield fake
     fake.close()

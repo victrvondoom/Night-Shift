@@ -4,7 +4,7 @@ One bot, one allowlist of Telegram user ids, one webhook route on the API.
 Night Shift pages the engineer here and accepts the same exact consent phrases the
 console does, typed. Voice notes are not accepted as consent: there is no
 speech-to-text in this path, so a voice note is answered with a request to
-type the phrase (voice conversations happen over Bolna).
+type the phrase (voice conversations happen over OmniDimension).
 """
 
 from __future__ import annotations
@@ -249,5 +249,5 @@ HELP = (
 
 
 def reply_text_and_voice(chat_id: Any, text: str, *, voice: bool = True) -> None:
-    """Reply in text. (Speech is Bolna's job; Telegram is the typed channel.)"""
+    """Reply in text. (Speech is OmniDimension's job; Telegram is the typed channel.)"""
     call("sendMessage", {"chat_id": chat_id, "text": text[:4000]})

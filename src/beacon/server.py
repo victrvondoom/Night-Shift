@@ -6,7 +6,7 @@
 * ``/k8s/audit``     Kubernetes audit webhook -> NATS ``beacon.changes``
 * ``/github/events`` GitHub webhook (HMAC verified) -> NATS ``beacon.changes``
 * ``/api/*``         read-only dashboard API for the console
-* ``/voice/*``       typed turns, console tools and the Bolna integration
+* ``/voice/*``       typed turns, console tools and the OmniDimension integration
 * ``/metrics``       Prometheus exposition
 
 The API holds no Kubernetes write permission: every change is made by the
@@ -29,7 +29,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from beacon import changes, dashboard_api, db, eventbus, events, secrets, voice_turn
+from beacon import (
+    changes,
+    dashboard_api,
+    db,
+    eventbus,
+    events,
+    ingest,
+    secrets,
+    voice_turn,
+    workspace_api,
+)
+from beacon.evidence import normalize
 
 logger = logging.getLogger("beacon.server")
 logging.basicConfig(level=logging.INFO)
@@ -53,9 +64,10 @@ if _origins:
         CORSMiddleware,
         allow_origins=_origins,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["content-type", "x-beacon-passcode"],
+        allow_headers=["content-type", "x-beacon-passcode", "x-beacon-user"],
     )
 app.include_router(dashboard_api.router, prefix="/api")
+app.include_router(workspace_api.router, prefix="/api")
 app.include_router(voice_turn.router, prefix="/voice")
 
 
@@ -109,6 +121,9 @@ async def alertmanager(request: Request) -> JSONResponse:
     for alert in firing:
         dedup = f"{alert.get('fingerprint')}-{alert.get('startsAt')}"
         await _emit(eventbus.ALERTS, {"alert": alert}, dedup_id=dedup)
+        ev = normalize.from_alert(alert)
+        if ev:
+            await ingest.publish_event(ev, normalize.redact_payload(alert))
     return JSONResponse({"accepted": len(firing)})
 
 
@@ -137,6 +152,9 @@ async def k8s_audit(request: Request, path_token: str = "") -> JSONResponse:
             {"kind": "k8s_audit", "event": item},
             dedup_id=str(item.get("auditID") or ""),
         )
+        ev = normalize.from_audit(item)
+        if ev:
+            await ingest.publish_event(ev, normalize.redact_payload(item))
         n += 1
     return JSONResponse({"accepted": n})
 
@@ -158,7 +176,26 @@ async def github_events(request: Request) -> JSONResponse:
         {"kind": kind, "event": json.loads(raw)},
         dedup_id=request.headers.get("x-github-delivery", ""),
     )
+    gh = normalize.from_github(kind, json.loads(raw), request.headers.get("x-github-delivery", ""))
+    if gh:
+        await ingest.publish_event(gh, normalize.redact_payload(json.loads(raw)))
     return JSONResponse({"accepted": 1})
+
+
+@app.post("/ingest/app-logs")
+async def app_logs(request: Request) -> JSONResponse:
+    """Application log shipper -> normalised events (only connection-error lines qualify)."""
+    if not (_token_ok(request, "APP_LOG_WEBHOOK_TOKEN") or _token_ok(request, "ALERT_WEBHOOK_TOKEN")):
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
+    payload = await request.json()
+    records = payload.get("records") or []
+    n = 0
+    for rec in records:
+        ev = normalize.from_app_log(rec) if isinstance(rec, dict) else None
+        if ev:
+            await ingest.publish_event(ev, normalize.redact_payload(rec))
+            n += 1
+    return JSONResponse({"accepted": n, "ignored": len(records) - n})
 
 
 @app.post("/api/schedule/morning-report")

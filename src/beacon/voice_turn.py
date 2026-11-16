@@ -5,14 +5,14 @@ only by how much it can prove about who is speaking:
 
 * **Console, typed** (``POST /turn``, ``POST /tools/{name}``; passcode). Text
   the engineer typed in the authenticated console. This is verified consent.
-* **Bolna custom functions** (``POST /bolna/tools/{name}``; bearer token +
+* **OmniDimension custom functions** (``POST /omnidim/tools/{name}``; bearer token +
   per-session token). The agent's LLM asking for a tool. It can read, propose
   and cancel; a consent tool is recorded as a *request* and held until the
-  engineer confirms it in the console. Nothing Bolna sends can execute a change.
-* **Bolna webhooks** (``POST /bolna/webhook``; shared secret + source IPs).
+  engineer confirms it in the console. Nothing OmniDimension sends can execute a change.
+* **OmniDimension webhooks** (``POST /omnidim/webhook``; shared secret + source IPs).
   Call lifecycle only: status, transcript, recording, cost. Never authorises.
 
-The Bolna API key stays here; the browser receives only the single-use
+The OmniDimension API key stays here; the browser receives only the single-use
 web-call session minted for it.
 """
 
@@ -33,7 +33,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from beacon import bolna, db, observability, secrets, store, voice_brief, voice_tools
+from beacon import db, observability, omnidim, secrets, store, voice_brief, voice_tools
 from beacon.turn_context import TurnContext, turn_context
 
 logger = logging.getLogger(__name__)
@@ -390,7 +390,7 @@ def _turn(body: dict[str, Any]) -> JSONResponse:
             "reply_text": reply_text,
             "spoken_text": spoken,
             "cited": cited,
-            # Speech is Bolna's job; a typed turn is answered in text.
+            # Speech is OmniDimension's job; a typed turn is answered in text.
             "audio_b64": None,
             "speech_marks": [],
             "voice": None,
@@ -420,7 +420,7 @@ async def voice_brief_route(incident_id: str, request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Bolna: sessions
+# OmniDimension: sessions
 # ---------------------------------------------------------------------------
 
 
@@ -431,7 +431,7 @@ def _hash(token: str) -> str:
 def new_voice_session(incident_id: str, *, channel: str) -> tuple[str, str]:
     """Create a Night Shift voice session row; returns ``(session_id, token)``.
 
-    The token is a per-call capability Bolna echoes back on every function
+    The token is a per-call capability OmniDimension echoes back on every function
     call. Only its hash is stored. It grants reads, proposals and cancellation
     for this one incident for thirty minutes, and never an approval.
     """
@@ -466,9 +466,13 @@ def user_data_for(
     }
 
 
-@router.post("/bolna/session")
-async def bolna_session(request: Request) -> JSONResponse:
-    """Mint a single-use Bolna web-call session for the authenticated console."""
+@router.post("/omnidim/session")
+async def omnidim_session(request: Request) -> JSONResponse:
+    """Create one OmniDimension session for the authenticated console.
+
+    Returns only ``ws_url`` (single use, 15-minute connect window) exactly as OmniDimension
+    returned it; the API key stays on the server.  Voice can read and propose, never approve.
+    """
     if not _passcode_ok(request):
         return _json(401, {"error": "passcode required"})
     body = await request.json()
@@ -478,24 +482,18 @@ async def bolna_session(request: Request) -> JSONResponse:
     incident = store.get_incident(incident_id, table_name=_incidents_table())
     if not incident:
         return _json(404, {"error": f"incident {incident_id} not found"})
-    if not bolna.configured():
-        return _json(503, {"error": "Bolna is not configured on this deployment"})
-    session_id, token = new_voice_session(incident_id, channel="bolna-web")
+    if not omnidim.configured():
+        return _json(503, {"error": "NOT_CONFIGURED: set OMNIDIM_API_KEY and OMNIDIM_AGENT_ID", "state": "NOT_CONFIGURED"})
+    session_id, token = new_voice_session(incident_id, channel="omnidim-web")
     try:
-        minted = bolna.mint_web_session(user_data_for(incident, session_id, token))
-    except bolna.BolnaError as exc:
-        logger.warning("bolna mint failed: %s", exc)
-        db.patch(_CALLS, session_id, {"status": "mint_failed", "error": str(exc)})
-        status = 429 if exc.status == 429 else 502
-        return _json(status, {"error": f"could not start a Bolna call: {exc}"})
-    db.patch(_CALLS, session_id, {"execution_id": minted.get("run_id")})
-    store.append_timeline(
-        incident_id,
-        "voice_call_started",
-        table_name=_incidents_table(),
-        detail={"session_id": session_id, "execution_id": minted.get("run_id")},
-    )
-    return _json(200, {"beacon_session": session_id, "session": minted})
+        minted = omnidim.create_session(user_data_for(incident, session_id, token), {"incident_id": incident_id, "beacon_session": session_id})
+    except omnidim.OmniDimError as exc:
+        logger.warning("omnidimension session failed: %s", exc.category)
+        db.patch(_CALLS, session_id, {"status": "create_failed", "error": exc.category})
+        return _json(429 if exc.status == 429 else 502, {"error": f"could not start a voice session: {exc.category}", "category": exc.category})
+    db.patch(_CALLS, session_id, {"execution_id": str(minted.get("session_id") or "")})
+    store.append_timeline(incident_id, "voice_call_started", table_name=_incidents_table(), detail={"session_id": session_id, "omnidim_session_id": minted.get("session_id")})
+    return _json(200, {"beacon_session": session_id, "ws_url": minted["ws_url"], "expires_at": minted.get("expires_at")})
 
 
 def _session_for(session_id: str, token: str) -> dict[str, Any] | None:
@@ -510,7 +508,7 @@ def _session_for(session_id: str, token: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Bolna: custom function calls
+# OmniDimension: custom function calls
 # ---------------------------------------------------------------------------
 
 _INT_ARGS = ("fix_id", "days", "max_uses")
@@ -536,21 +534,21 @@ def _ip_allowed(request: Request, env: str) -> bool:
     return any(ip in ipaddress.ip_network(a, strict=False) for a in allowed)
 
 
-@router.post("/bolna/tools/{name}")
-async def bolna_tool(name: str, request: Request) -> JSONResponse:
-    """A Bolna custom function calling one Night Shift tool.
+@router.post("/omnidim/tools/{name}")
+async def omnidim_tool(name: str, request: Request) -> JSONResponse:
+    """A OmniDimension custom function calling one Night Shift tool.
 
     Authenticated twice: the bearer token configured on the agent (proves the
-    caller is our Bolna agent) and the per-session token (binds the call to one
+    caller is our OmniDimension agent) and the per-session token (binds the call to one
     incident). Arguments are whatever the agent's LLM produced, so they are
     validated here and are never treated as the engineer's words.
     """
     bearer = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
-    if not _eq(bearer, secrets.get("BOLNA_TOOL_TOKEN")):
+    if not _eq(bearer, secrets.get("OMNIDIM_TOOL_TOKEN")):
         return _json(401, {"error": "unauthorised"})
-    if not _ip_allowed(request, "BOLNA_ALLOWED_IPS"):
+    if not _ip_allowed(request, "OMNIDIM_ALLOWED_IPS"):
         return _json(403, {"error": "source address not allowed"})
-    tool = voice_tools.BOLNA_ALIASES.get(name, name)
+    tool = voice_tools.OMNIDIM_ALIASES.get(name, name)
     if tool not in voice_tools.TOOL_FUNCTIONS:
         return _json(404, {"error": f"unknown tool {name}"})
     try:
@@ -589,9 +587,9 @@ async def bolna_tool(name: str, request: Request) -> JSONResponse:
             # What the model says the engineer said. Used only to decide what to
             # read back; the attestation below keeps it from ever being consent.
             transcript=claimed,
-            channel="bolna",
+            channel="omnidim",
             attestation={
-                "evidence": "bolna_llm_function_call",
+                "evidence": "omnidim_llm_function_call",
                 "stt": None,
                 "session_id": session["session_id"],
                 "execution_id": session.get("execution_id"),
@@ -614,12 +612,12 @@ async def bolna_tool(name: str, request: Request) -> JSONResponse:
             "evidence": out["evidence"],
         },
     )
-    observability.metric("BolnaToolCalls", 1)
+    observability.metric("OmniDimToolCalls", 1)
     return _json(200, out["result"])
 
 
-@router.get("/bolna/session/{session_id}/events")
-async def bolna_events(session_id: str, request: Request) -> JSONResponse:
+@router.get("/omnidim/session/{session_id}/events")
+async def omnidim_events(session_id: str, request: Request) -> JSONResponse:
     """Tool calls the live call has made so far (the console polls this)."""
     if not _passcode_ok(request):
         return _json(401, {"error": "passcode required"})
@@ -642,203 +640,41 @@ async def bolna_events(session_id: str, request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Bolna: webhooks, history, recordings, cost
+# OmniDimension: transcript audit linkage
 # ---------------------------------------------------------------------------
 
 
-def _apply_execution(session_id: str, data: dict[str, Any]) -> dict[str, Any]:
-    """Store what Bolna reported about a call. Metadata only: no approvals."""
-    summary = bolna.summarise_execution(data)
-    db.patch(
-        _CALLS,
-        session_id,
-        {
-            **{k: v for k, v in summary.items() if v is not None},
-            "updated_at": _now().isoformat(),
-        },
-    )
-    return summary
+@router.post("/omnidim/session/{session_id}/transcript")
+async def omnidim_transcript(session_id: str, request: Request) -> JSONResponse:
+    """The console stores *final* transcript turns (the SDK emits cumulative snapshots).
 
-
-@router.post("/bolna/webhook")
-async def bolna_webhook(request: Request) -> JSONResponse:
-    """Call lifecycle from Bolna: status, transcript, recording, cost.
-
-    A webhook is a report about a call that already happened. It updates the
-    call record and the incident timeline and has no path to an approval, so a
-    transcript that arrives after the call can never authorise anything.
+    Transcript text is evidence for audit only; it has no path to an approval.
     """
-    secret = secrets.get("BOLNA_WEBHOOK_SECRET")
-    given = request.headers.get("x-beacon-webhook-secret") or request.query_params.get(
-        "secret", ""
-    )
-    if not _eq(given, secret):
-        return _json(401, {"error": "unauthorised"})
-    if not _ip_allowed(request, "BOLNA_WEBHOOK_IPS"):
-        return _json(403, {"error": "source address not allowed"})
-    try:
-        data = dict(await request.json())
-    except Exception:
-        return _json(400, {"error": "a JSON object is required"})
-    execution_id = str(data.get("id") or data.get("execution_id") or "")
-    if not _ID_RE.match(execution_id):
-        return _json(400, {"error": "execution id missing"})
-    rows = db.scan(_CALLS, "doc->>'execution_id' = %s", (execution_id,))
-    if not rows:
-        return _json(202, {"ok": True, "matched": False})
-    row = max(rows, key=lambda r: str(r.get("created_at", "")))
-    previous = row.get("status")
-    summary = _apply_execution(str(row["session_id"]), data)
-    if summary["status"] != previous:
-        store.append_timeline(
-            str(row["incident_id"]),
-            "voice_call_status",
-            table_name=_incidents_table(),
-            detail={
-                "session_id": row["session_id"],
-                "execution_id": execution_id,
-                "status": summary["status"],
-                "duration_seconds": summary["duration_seconds"],
-                "total_cost": summary["total_cost"],
-            },
-        )
-    return _json(200, {"ok": True, "matched": True})
-
-
-def _public_call(row: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in row.items() if k not in ("token_hash",)}
-
-
-@router.get("/bolna/calls")
-async def bolna_calls(request: Request) -> JSONResponse:
-    """Night Shift's own record of voice calls, newest first (``?incident_id=``)."""
-    if not _passcode_ok(request):
-        return _json(401, {"error": "passcode required"})
-    incident_id = request.query_params.get("incident_id")
-    rows = (
-        db.scan(_CALLS, "doc->>'incident_id' = %s", (incident_id,))
-        if incident_id
-        else db.scan(_CALLS)
-    )
-    rows.sort(key=lambda r: str(r.get("created_at", "")), reverse=True)
-    calls = [
-        {k: v for k, v in _public_call(r).items() if k != "events"} for r in rows[:100]
-    ]
-    costs = [float(c["total_cost"]) for c in calls if c.get("total_cost") is not None]
-    return _json(
-        200,
-        {
-            "calls": calls,
-            "total_cost": round(sum(costs), 4),
-            "costed_calls": len(costs),
-        },
-    )
-
-
-@router.get("/bolna/calls/{session_id}")
-async def bolna_call(session_id: str, request: Request) -> JSONResponse:
-    """One call with transcript, recording reference and cost, refreshed from Bolna."""
     if not _passcode_ok(request):
         return _json(401, {"error": "passcode required"})
     row = db.get(_CALLS, session_id) if _ID_RE.match(session_id) else None
     if not row:
         return _json(404, {"error": "unknown session"})
-    if row.get("execution_id") and not row.get("final") and bolna.configured():
-        try:
-            _apply_execution(session_id, bolna.get_execution(str(row["execution_id"])))
-            row = db.get(_CALLS, session_id) or row
-        except bolna.BolnaError as exc:
-            logger.warning("execution refresh failed: %s", exc)
-    return _json(200, {"call": _public_call(row)})
+    body = dict(await request.json())
+    role = "agent" if body.get("role") == "agent" else "user"
+    text = str(body.get("text") or "")[:2000]
+    if body.get("final") is not True or not text:
+        return _json(200, {"stored": False, "reason": "only final, non-empty turns are stored"})
+    db.append(_CALLS, session_id, "transcript", {"t": _now().isoformat(), "role": role, "text": text})
+    return _json(200, {"stored": True})
 
 
-@router.get("/bolna/history")
-async def bolna_history(request: Request) -> JSONResponse:
-    """Bolna's execution history for the agent (last seven days)."""
-    if not _passcode_ok(request):
-        return _json(401, {"error": "passcode required"})
-    try:
-        return _json(200, {"executions": bolna.list_executions()})
-    except bolna.BolnaError as exc:
-        return _json(
-            exc.status if exc.status in (401, 503) else 502, {"error": str(exc)}
-        )
-
-
-@router.get("/bolna/agent")
-async def bolna_agent(request: Request) -> JSONResponse:
-    """The agent as stored at Bolna, with tokens and webhook URL removed."""
-    if not _passcode_ok(request):
-        return _json(401, {"error": "passcode required"})
-    try:
-        return _json(200, {"agent_id": bolna.agent_id(), "agent": bolna.get_agent()})
-    except bolna.BolnaError as exc:
-        return _json(
-            exc.status if exc.status in (401, 503) else 502, {"error": str(exc)}
-        )
-
-
-@router.get("/recordings/{session_id}")
-async def recording(session_id: str, request: Request) -> JSONResponse:
-    """The recording reference for a call (kept for the Audit view's contract)."""
-    if not _passcode_ok(request):
-        return _json(401, {"error": "passcode required"})
-    row = db.get(_CALLS, session_id) if _ID_RE.match(session_id) else None
-    if not row:
-        return _json(404, {"error": "no recording for this session"})
-    return _json(
-        200,
-        {
-            "session_id": session_id,
-            "status": row.get("status"),
-            "duration_seconds": row.get("duration_seconds"),
-            "audio_url": row.get("recording_url"),
-        },
-    )
-
-
-@router.post("/sessions/{session_id}/summary")
-async def session_summary(session_id: str, request: Request) -> JSONResponse:
-    """Bolna's own summary of a call, when the agent has call summaries on."""
+@router.post("/omnidim/session/{session_id}/status")
+async def omnidim_status(session_id: str, request: Request) -> JSONResponse:
+    """The console reports the SDK's real session states (active/ended+reason)."""
     if not _passcode_ok(request):
         return _json(401, {"error": "passcode required"})
     row = db.get(_CALLS, session_id) if _ID_RE.match(session_id) else None
     if not row:
         return _json(404, {"error": "unknown session"})
-    if not row.get("final") and row.get("execution_id") and bolna.configured():
-        try:
-            _apply_execution(session_id, bolna.get_execution(str(row["execution_id"])))
-            row = db.get(_CALLS, session_id) or row
-        except bolna.BolnaError as exc:
-            return _json(502, {"error": str(exc)})
-    if not row.get("summary"):
-        return _json(404, {"error": "Bolna has no summary for this call"})
-    return _json(
-        200,
-        {
-            "cached": True,
-            "summary": row["summary"],
-            "seconds": row.get("duration_seconds"),
-        },
-    )
-
-
-@router.post("/sessions/{session_id}/attest")
-async def session_attest(session_id: str, request: Request) -> JSONResponse:
-    """Kept for the Audit view: says plainly that nothing can be scored.
-
-    Bolna gives Night Shift no word-level confidence, and consent is typed, so there
-    is no audio to score. Inventing a number here would be worse than none.
-    """
-    if not _passcode_ok(request):
-        return _json(401, {"error": "passcode required"})
-    return _json(
-        200,
-        {
-            "ok": False,
-            "checks": [],
-            "problems": [],
-            "note": "No speech confidence is available: approvals are typed, "
-            "and Bolna reports no word-level confidence.",
-        },
-    )
+    body = dict(await request.json())
+    state = str(body.get("state") or "")[:40]
+    db.patch(_CALLS, session_id, {"status": state, "end_reason": str(body.get("reason") or "")[:80], "updated_at": _now().isoformat()})
+    if state in ("active", "ended") and row.get("incident_id"):
+        store.append_timeline(str(row["incident_id"]), f"voice_session_{state}", table_name=_incidents_table(), detail={"session_id": session_id, "reason": str(body.get("reason") or "")})
+    return _json(200, {"ok": True})

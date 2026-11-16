@@ -1,6 +1,6 @@
 """Who may authorise a change, tested through the HTTP API.
 
-A Bolna function call is a model asking for something. It can read, propose and
+A OmniDimension function call is a model asking for something. It can read, propose and
 cancel. It can never approve: that takes the exact phrase typed by the engineer
 in the passcode-authenticated console.
 """
@@ -12,20 +12,20 @@ import pytest
 from beacon import approvals, db, store
 from tests.conftest import PASS
 
-BOLNA = {"authorization": "Bearer tool-token"}
+OMNIDIM = {"authorization": "Bearer tool-token"}
 
 
 @pytest.fixture()
-def call(client, incident, bolna_api, cluster):
-    """A live Bolna web call on the incident: returns a function-call helper."""
+def call(client, incident, omnidim_api, cluster):
+    """A live OmniDimension web call on the incident: returns a function-call helper."""
     resp = client.post(
-        "/voice/bolna/session",
+        "/voice/omnidim/session",
         json={"incident_id": incident["incident_id"]},
         headers=PASS,
     )
     assert resp.status_code == 200, resp.text
     session_id = resp.json()["beacon_session"]
-    token = bolna_api.requests[-1]["body"]["user_data"]["beacon_token"]
+    token = omnidim_api.requests[-1]["body"]["custom_variables"]["beacon_token"]
 
     def tool(name: str, **args: Any) -> dict[str, Any]:
         body = {
@@ -34,13 +34,13 @@ def call(client, incident, bolna_api, cluster):
             "beacon_token": token,
             **args,
         }
-        out = client.post(f"/voice/bolna/tools/{name}", json=body, headers=BOLNA)
+        out = client.post(f"/voice/omnidim/tools/{name}", json=body, headers=OMNIDIM)
         assert out.status_code == 200, out.text
         return out.json()
 
     tool.session_id = session_id  # type: ignore[attr-defined]
     tool.token = token  # type: ignore[attr-defined]
-    tool.run_id = resp.json()["session"]["run_id"]  # type: ignore[attr-defined]
+    tool.ws_url = resp.json()["ws_url"]  # type: ignore[attr-defined]
     return tool
 
 
@@ -74,26 +74,26 @@ def _typed(client, incident, text):
 
 
 def test_session_needs_the_passcode_and_never_returns_the_api_key(
-    client, incident, bolna_api
+    client, incident, omnidim_api
 ):
     assert (
         client.post(
-            "/voice/bolna/session", json={"incident_id": incident["incident_id"]}
+            "/voice/omnidim/session", json={"incident_id": incident["incident_id"]}
         ).status_code
         == 401
     )
     resp = client.post(
-        "/voice/bolna/session",
+        "/voice/omnidim/session",
         json={"incident_id": incident["incident_id"]},
         headers=PASS,
     )
-    assert "bn-test-key" not in resp.text and "beacon_token" not in resp.text
+    assert "od-test-key" not in resp.text and "beacon_token" not in resp.text
 
 
-def test_mint_failure_is_reported_not_hidden(client, incident, bolna_api):
-    bolna_api.fail_mint = 429
+def test_mint_failure_is_reported_not_hidden(client, incident, omnidim_api):
+    omnidim_api.fail_mint = 429
     resp = client.post(
-        "/voice/bolna/session",
+        "/voice/omnidim/session",
         json={"incident_id": incident["incident_id"]},
         headers=PASS,
     )
@@ -109,11 +109,11 @@ def test_tool_call_needs_the_agent_bearer_token(client, call, incident):
         "beacon_session": call.session_id,
         "beacon_token": call.token,
     }
-    assert client.post("/voice/bolna/tools/propose_fix", json=body).status_code == 401
+    assert client.post("/voice/omnidim/tools/propose_fix", json=body).status_code == 401
     wrong = {"authorization": "Bearer nope"}
     assert (
         client.post(
-            "/voice/bolna/tools/propose_fix", json=body, headers=wrong
+            "/voice/omnidim/tools/propose_fix", json=body, headers=wrong
         ).status_code
         == 401
     )
@@ -131,7 +131,7 @@ def test_tool_call_needs_a_live_session_for_that_incident(client, call, incident
         {"beacon_session": "bs_missing"},
     ):
         resp = client.post(
-            "/voice/bolna/tools/propose_fix", json={**base, **bad}, headers=BOLNA
+            "/voice/omnidim/tools/propose_fix", json={**base, **bad}, headers=OMNIDIM
         )
         assert resp.status_code == 403
     db.patch(
@@ -139,7 +139,7 @@ def test_tool_call_needs_a_live_session_for_that_incident(client, call, incident
     )
     assert (
         client.post(
-            "/voice/bolna/tools/propose_fix", json=base, headers=BOLNA
+            "/voice/omnidim/tools/propose_fix", json=base, headers=OMNIDIM
         ).status_code
         == 403
     )
@@ -153,14 +153,14 @@ def test_unknown_tool_and_ip_allowlist(client, call, incident, monkeypatch):
     }
     assert (
         client.post(
-            "/voice/bolna/tools/run_shell", json=base, headers=BOLNA
+            "/voice/omnidim/tools/run_shell", json=base, headers=OMNIDIM
         ).status_code
         == 404
     )
-    monkeypatch.setenv("BOLNA_ALLOWED_IPS", "203.0.113.0/24")
+    monkeypatch.setenv("OMNIDIM_ALLOWED_IPS", "203.0.113.0/24")
     assert (
         client.post(
-            "/voice/bolna/tools/propose_fix", json=base, headers=BOLNA
+            "/voice/omnidim/tools/propose_fix", json=base, headers=OMNIDIM
         ).status_code
         == 403
     )
@@ -169,7 +169,7 @@ def test_unknown_tool_and_ip_allowlist(client, call, incident, monkeypatch):
 # -- what a voice call may and may not do ----------------------------------------
 
 
-def test_bolna_can_read_and_propose_with_a_dry_run(call, cluster):
+def test_omnidim_can_read_and_propose_with_a_dry_run(call, cluster):
     assert call("get_incident_brief")["alarm_name"] == "DemoApiDown"
     proposal = call("propose_fix")
     assert proposal["fix_id"] == 1 and proposal["dry_run"]["ok"]
@@ -177,7 +177,7 @@ def test_bolna_can_read_and_propose_with_a_dry_run(call, cluster):
     assert cluster["dry_runs"] == 1 and cluster["restarts"] == 0
 
 
-def test_bolna_approve_is_held_and_nothing_executes(call, cluster, tables, incident):
+def test_omnidim_approve_is_held_and_nothing_executes(call, cluster, tables, incident):
     call("propose_fix")
     out = call("approve_fix", fix_id="1", confirmation_phrase="approve fix 1")
     assert out["approved"] is False and out["pending_confirmation"] is True
@@ -186,8 +186,8 @@ def test_bolna_approve_is_held_and_nothing_executes(call, cluster, tables, incid
     fresh = _fresh(tables, incident)
     assert fresh["status"] == "awaiting_engineer"
     pending = fresh["pending_confirmations"][0]
-    assert pending["provenance"] == "bolna_llm_function_call"
-    assert pending["execution_id"] == call.run_id
+    assert pending["provenance"] == "omnidim_llm_function_call"
+    assert pending["execution_id"] == "4521"
     # the proposal is retained, still pending, for a verified confirmation
     assert approvals.get_proposal(
         incident["incident_id"], 1, table_name=tables["APPROVALS_TABLE_NAME"]
@@ -225,7 +225,7 @@ def test_typed_phrase_confirms_the_held_request_and_executes_once(
     (record,) = _approvals(tables, incident)
     att = record["attestation"]
     assert att["evidence"] == "typed_console" and record["channel"] == "typed"
-    assert att["voice_request"]["execution_id"] == call.run_id
+    assert att["voice_request"]["execution_id"] == "4521"
     assert record["used_at"] and record["execute_result"]["ok"]
     fresh = _fresh(tables, incident)
     assert fresh["status"] == "resolved" and fresh["pending_confirmations"] == []
@@ -266,7 +266,7 @@ def test_console_event_channel_cannot_approve(call, client, incident, cluster):
             "incident_id": incident["incident_id"],
             "args": {"fix_id": 1, "confirmation_phrase": "approve fix 1"},
             "transcript": "approve fix 1",
-            "channel": "bolna",
+            "channel": "omnidim",
         },
         headers=PASS,
     ).json()
@@ -376,7 +376,7 @@ def test_console_sees_the_calls_tool_events(call, client):
     call("propose_fix")
     call("approve_fix", fix_id="1", confirmation_phrase="approve fix 1")
     data = client.get(
-        f"/voice/bolna/session/{call.session_id}/events", headers=PASS
+        f"/voice/omnidim/session/{call.session_id}/events", headers=PASS
     ).json()
     assert [e["name"] for e in data["events"]] == ["propose_fix", "approve_fix"]
     assert data["pending_confirmations"][0]["phrase"] == "approve fix 1"

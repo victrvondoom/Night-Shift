@@ -256,7 +256,7 @@ def postmortem(
         out.append("## The night, in the engineer's words")
         out.append("")
         out.append(
-            "Summary of the Bolna call behind the approval "
+            "Summary of the OmniDimension call behind the approval "
             "(names and numbers redacted before it was stored):"
         )
         for session_id, entry in spoken.items():

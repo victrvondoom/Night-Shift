@@ -28,8 +28,8 @@ $K -n beacon create secret generic beacon-bootstrap --dry-run=client -o yaml \
   --from-literal=MINIO_SECRET_KEY="${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}" | $K apply -f -
 # Application secrets: seeded into Vault by the vault-seed Job; Night Shift reads them there.
 args=()
-for name in PASSCODE ALERT_WEBHOOK_TOKEN AUDIT_WEBHOOK_TOKEN BOLNA_API_KEY BOLNA_AGENT_ID \
-  BOLNA_TOOL_TOKEN BOLNA_WEBHOOK_SECRET GITHUB_PR_TOKEN GITHUB_WEBHOOK_SECRET \
+for name in PASSCODE ALERT_WEBHOOK_TOKEN AUDIT_WEBHOOK_TOKEN OMNIDIM_API_KEY OMNIDIM_AGENT_ID TAVILY_API_KEY BIFROST_VIRTUAL_KEY \
+  OMNIDIM_TOOL_TOKEN GITHUB_PR_TOKEN GITHUB_WEBHOOK_SECRET \
   TELEGRAM_BOT_TOKEN SLACK_WEBHOOK_URL PAGERDUTY_ROUTING_KEY; do
   value="${!name:-}"
   [ -n "$value" ] && args+=(--from-literal="$name=$value")

@@ -61,7 +61,7 @@ export function Footer({ version }: { version?: string }) {
         Night Shift
       </div>
       <div className="footer-line">
-        <span>© Night Shift · voice by Bolna · running on Kubernetes</span>
+        <span>© Night Shift · voice by OmniDimension · running on Kubernetes</span>
         <span className="kbd-hint" title="Keyboard shortcuts">
           <kbd>g</kbd> <kbd>b</kbd> board · <kbd>g</kbd> <kbd>a</kbd> analytics · <kbd>g</kbd> <kbd>c</kbd> contracts · <kbd>g</kbd> <kbd>u</kbd> audit · <kbd>g</kbd> <kbd>p</kbd> report · <kbd>g</kbd> <kbd>s</kbd> safety · <kbd>g</kbd> <kbd>h</kbd> home · <kbd>/</kbd> talk · <kbd>?</kbd> help · <kbd>esc</kbd> close
         </span>

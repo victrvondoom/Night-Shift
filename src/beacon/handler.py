@@ -302,7 +302,7 @@ def _store_and_investigate(
 ) -> str | None:
     """Store the incident, pre-fetch investigation data, optionally call.
 
-    The outbound call (Bolna, only when enabled) and the pre-fetch run in
+    The outbound call (OmniDimension, only when enabled) and the pre-fetch run in
     parallel so cached data is ready before the engineer picks up.  Failures
     are logged but never block the notification that was already sent.
     """

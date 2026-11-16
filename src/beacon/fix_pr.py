@@ -291,7 +291,7 @@ def pr_body(
                 else ""
             )
             + (
-                f", preceded by Bolna call `{(att.get('voice_request') or {}).get('execution_id')}`"
+                f", preceded by OmniDimension call `{(att.get('voice_request') or {}).get('execution_id')}`"
                 if (att.get("voice_request") or {}).get("execution_id")
                 else ""
             )

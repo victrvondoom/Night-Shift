@@ -1,0 +1,16 @@
+# Local dependencies for `make demo-up` when you do not have the binaries on PATH.
+# NOTE: could not be exercised in the authoring container (no Docker daemon).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: beacon, POSTGRES_PASSWORD: beacon, POSTGRES_DB: beacon }
+    ports: ["5433:5432"]
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js"]
+    ports: ["4222:4222"]
+  opa:
+    image: openpolicyagent/opa:1.0.0
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policy"]
+    volumes: ["../../policy:/policy:ro"]
+    ports: ["8281:8181"]

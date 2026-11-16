@@ -42,6 +42,7 @@ class VerifyCheck:
     ok: bool
     detail: str = ""
     metric: dict[str, Any] = field(default_factory=dict)
+    checked_at: str = field(default_factory=lambda: datetime.now(tz=UTC).isoformat())
 
 
 @dataclass(slots=True)

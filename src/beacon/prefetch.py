@@ -7,9 +7,8 @@ from functools import cache
 from importlib.resources import files
 from typing import TYPE_CHECKING, Any
 
-import litellm
-
 from beacon import store, tools
+from beacon.llm import gateway
 
 if TYPE_CHECKING:
     from beacon.config import NightShiftConfig
@@ -67,7 +66,7 @@ def plan(analysis: str, trigger: TriggerInfo, config: NightShiftConfig) -> dict[
     )
 
     try:
-        response: Any = litellm.completion(
+        response: Any = gateway.completion(
             model=config.litellm_model,
             messages=[
                 {"role": "system", "content": system_prompt},

@@ -1,11 +1,8 @@
 /**
- * One voice interface, two backends.
+ * One typed/push-to-talk console transport; live voice lives in the OmniDimension workspace panel.
  *
  * - `console`: push-to-talk or typed text → POST /voice/turn on the Night Shift API, where a local
  *   model (Ollama) runs the tools. Typed text is the verified consent channel.
- * - `bolna`: a live Bolna Web Call (WebRTC). STT, turn-taking, the LLM and TTS run at Bolna;
- *   the agent's tool calls go from Bolna to the Night Shift API as custom functions, and the
- *   console shows them by polling the session. A spoken approval is held until typed.
  *
  * Both share TOOL_SCHEMAS (exported by scripts/export_tools.py) and the same Python tools,
  * so the safety model does not change when the mouth and ears do.
@@ -50,7 +47,7 @@ export interface VoiceSession {
 }
 
 export interface VoiceTransport {
-  readonly name: "console" | "bolna";
+  readonly name: "console";
   start(session: VoiceSession, handlers: VoiceTransportHandlers): Promise<void>;
   /** Push microphone audio (PCM16 mono at `sampleRate`). Full-duplex backends accept it continuously. */
   sendAudio(pcm16: Int16Array, sampleRate: number): void;

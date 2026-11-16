@@ -1,6 +1,6 @@
 """The seven tools the voice agent can call, and their JSON schemas.
 
-``TOOL_SCHEMAS`` is the contract shared by every voice backend (the Bolna voice agent, the local
+``TOOL_SCHEMAS`` is the contract shared by every voice backend (the OmniDimension voice agent, the local
 litellm/Ollama loop for typed turns
 later).  The functions are plain Python so any backend can dispatch to them.
 
@@ -114,7 +114,7 @@ def _start_execution(payload: dict[str, Any]) -> str:
     return workflows.start_remediation(payload)
 
 
-# Evidence kinds that prove a person, not a model, authorised a change. A Bolna
+# Evidence kinds that prove a person, not a model, authorised a change. A OmniDimension
 # custom-function call carries only what the agent's LLM put in its arguments:
 # no caller transcript, no speaker attribution, no confidence. That is a
 # request for consent, never consent.
@@ -1233,18 +1233,18 @@ TOOL_FUNCTIONS: dict[str, Callable[..., dict[str, Any]]] = {
 }
 
 
-# Bolna knows the evidence tool by the name in the product brief.
-BOLNA_ALIASES = {"get_incident_evidence": "get_evidence"}
+# OmniDimension knows the evidence tool by the name in the product brief.
+OMNIDIM_ALIASES = {"get_incident_evidence": "get_evidence"}
 
 
-def bolna_tool_schemas() -> list[dict[str, Any]]:
-    """TOOL_SCHEMAS as Bolna custom functions see them.
+def omnidim_tool_schemas() -> list[dict[str, Any]]:
+    """TOOL_SCHEMAS as OmniDimension custom functions see them.
 
     Same nine tools; the evidence tool is exposed as ``get_incident_evidence``
     and the contract tool gains the phrase argument the other consent tools
     already have, so the backend can tell a read-back request from a grant.
     """
-    reverse = {v: k for k, v in BOLNA_ALIASES.items()}
+    reverse = {v: k for k, v in OMNIDIM_ALIASES.items()}
     out = []
     for schema in TOOL_SCHEMAS:
         item = json.loads(json.dumps(schema))

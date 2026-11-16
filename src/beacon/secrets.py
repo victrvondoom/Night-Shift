@@ -1,7 +1,7 @@
 """Secrets: HashiCorp Vault (KV v2) first, environment as the local fallback.
 
-``get("BOLNA_API_KEY")`` reads the env var of that name if set (local runs,
-tests), else key ``BOLNA_API_KEY`` from the KV v2 secret at
+``get("OMNIDIM_API_KEY")`` reads the env var of that name if set (local runs,
+tests), else key ``OMNIDIM_API_KEY`` from the KV v2 secret at
 ``$VAULT_ADDR/v1/$VAULT_KV_MOUNT/data/$VAULT_SECRET_PATH``. In Kubernetes the
 token comes from the pod's service account via Vault's Kubernetes auth.
 """

@@ -43,7 +43,7 @@ def _confidence_of(
 ) -> dict[str, Any]:
     """How clearly the phrase was heard, and where that number came from.
 
-    Typed consent has no audio and so no confidence. Bolna reports no per-word
+    Typed consent has no audio and so no confidence. OmniDimension reports no per-word
     confidence to Night Shift for a live call, so none is shown: a number here would
     have to be invented. The field stays so a channel that does measure one can
     report it, and says plainly when nothing was measured.
@@ -163,7 +163,7 @@ def build(
             "transcriber": attestation.get("stt"),
             "session_id": attestation.get("session_id"),
             # how Night Shift knows a person said this: typed_console, typed_telegram
-            # or contract. A Bolna function call alone is never listed here.
+            # or contract. A OmniDimension function call alone is never listed here.
             "provenance": attestation.get("evidence"),
             # the voice request that preceded a typed confirmation, if any
             "voice_request": (
@@ -233,7 +233,7 @@ def build(
         "proof": {
             "recording": recording_url,
             "approval_id": approval.get("approval_id"),
-            # the Bolna execution that holds the call's transcript and recording
+            # the OmniDimension execution that holds the call's transcript and recording
             "voice_execution_id": voice_request.get("execution_id"),
         },
     }

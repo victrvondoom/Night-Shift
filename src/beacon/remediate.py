@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from beacon import approvals, channels, k8s, observability, policy, store
-from beacon.remediation import registry
+from beacon.remediation import guard, registry
 from beacon.remediation.base import ParamError
 from beacon.remediation.verify import verify_all
 
@@ -87,6 +87,9 @@ def dryrun(event: dict[str, Any]) -> dict[str, Any]:
     except ParamError as exc:
         return _error(event, str(exc))
 
+    guard_error = guard.sandbox_error(params)
+    if guard_error:
+        return _error(event, guard_error, action=spec.id, params=params)
     allowed, reasons = policy.evaluate("dryrun", spec.id, params)
     if not allowed:
         return _error(
@@ -166,6 +169,9 @@ def execute(event: dict[str, Any]) -> dict[str, Any]:
     why = approvals.is_valid(record, spec.id, params)
     if why:
         return _error(event, why)
+    guard_error = guard.sandbox_error(params)
+    if guard_error:
+        return _error(event, guard_error)
     allowed, reasons = policy.evaluate("execute", spec.id, params, approval=record)
     if not allowed:
         return _error(event, "policy denied: " + "; ".join(reasons))

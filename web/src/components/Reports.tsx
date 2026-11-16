@@ -152,7 +152,7 @@ export function Postmortem({ id, api, fallback, onToast }: { id: string; api: Ap
 
 type AuditFilter = "all" | "approvals" | "contracts" | "executed";
 
-/** Where the words came from — and, when a Bolna call preceded them, its recording. */
+/** Where the words came from — and, when a OmniDimension call preceded them, its recording. */
 function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; onListen?: (sessionId: string) => Promise<string | null>; onSummarise?: (sessionId: string, incidentId: string) => Promise<string | null>; onAttest?: (sessionId: string, incidentId: string) => Promise<{ ok: boolean; checks: Array<{ phrase: string; ok: boolean; confidence: number | null; weakest_word?: string | null; why?: string; one_voice?: { ok: boolean | null; voices: string[] } }>; problems: string[]; typed?: Array<{ quote?: string; event?: string }>; note?: string } | null> }) {
   const [state, setState] = useState<"idle" | "loading" | "playing" | "gone">("idle");
   const [src, setSrc] = useState<string | null>(null);
@@ -169,7 +169,7 @@ function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; 
   const scorable: string | null = null;
   const bits: string[] = [];
   if (a.stt === "typed") bits.push(a.evidence === "typed_telegram" ? "typed in Telegram" : "typed in the console");
-  if (a.voice_request?.execution_id) bits.push("after a Bolna voice request");
+  if (a.voice_request?.execution_id) bits.push("after a OmniDimension voice request");
   if (typeof a.confidence === "number") bits.push(`${Math.round(a.confidence * 100)}% confidence`);
   if (a.language) bits.push(a.language);
   if (!bits.length && !session) return null;
@@ -183,7 +183,7 @@ function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; 
           <button
             className="btn ghost small"
             disabled={state === "loading" || state === "gone"}
-            title="Play the recording of the Bolna call that preceded this approval"
+            title="Play the recording of the OmniDimension call that preceded this approval"
             onClick={() => {
               setState("loading");
               void onListen(session).then((url) => {
@@ -202,7 +202,7 @@ function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; 
         <button
           className="btn ghost small"
           disabled={summarising}
-          title="The summary Bolna produced for this call; kept on the incident and printed in the postmortem"
+          title="The summary OmniDimension produced for this call; kept on the incident and printed in the postmortem"
           onClick={() => {
             setSummarising(true);
             void onSummarise(session, row.incident_id!)
@@ -217,7 +217,7 @@ function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; 
         <button
           className="btn ghost small"
           disabled={checking}
-          title="No speech confidence is available: approvals are typed, and Bolna reports no word-level confidence."
+          title="No speech confidence is available: approvals are typed, and OmniDimension reports no word-level confidence."
           onClick={() => {
             setChecking(true);
             void onAttest(scorable, row.incident_id!)
@@ -256,7 +256,7 @@ function Attestation({ row, onListen, onSummarise, onAttest }: { row: AuditRow; 
       ) : null}
       {summary ? (
         <div className="session-summary">
-          <div className="eyebrow">What was said · summary of the Bolna call</div>
+          <div className="eyebrow">What was said · summary of the OmniDimension call</div>
           {summary.split("\n").filter(Boolean).map((line, i) => (
             <div key={i}>{line.replace(/^[-*]\s*/, "• ")}</div>
           ))}
