@@ -4,7 +4,7 @@ PY ?= .venv/bin/python
 K3D_CLUSTER ?= beacon
 export K3D_CLUSTER
 
-.PHONY: help setup test-services test lint web cluster up down snapshot break-netpol bad-deploy restore e2e logs demo-up demo-status demo-trigger demo-reset demo-verify demo-down hackathon-verify
+.PHONY: help setup test-services test lint web cluster up down snapshot break-netpol bad-deploy restore e2e logs demo-up demo-status demo-trigger demo-reset demo-verify demo-down hackathon-verify live-preflight live-provider-check live-sandbox-up live-sandbox-verify
 
 help:
 	@grep -E '^[a-z0-9-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -67,6 +67,18 @@ demo-verify: ## run the browser journey against the running stack
 
 demo-down: ## stop everything demo-up started
 	scripts/demo.sh down
+
+live-preflight: ## config + service availability (no secrets printed, nothing mutated)
+	$(PY) scripts/live_preflight.py
+
+live-provider-check: ## one bounded REAL request per configured provider (add ARGS=--voice-session for OmniDimension)
+	$(PY) scripts/live_provider_check.py $(ARGS)
+
+live-sandbox-up: ## deploy to an explicitly named sandbox cluster (fails closed)
+	scripts/live_sandbox.sh up
+
+live-sandbox-verify: ## cluster integration tests against the sandbox (fails closed)
+	scripts/live_sandbox.sh verify
 
 hackathon-verify: ## tests + build + (if running) journey -> .agent/verification-results.json
 	$(PY) scripts/hackathon_verify.py

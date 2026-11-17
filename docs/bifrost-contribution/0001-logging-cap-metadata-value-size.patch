@@ -1,0 +1,117 @@
+diff --git a/plugins/logging/main.go b/plugins/logging/main.go
+index 0996e98..51de930 100644
+--- a/plugins/logging/main.go
++++ b/plugins/logging/main.go
+@@ -15,6 +15,7 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/bytedance/sonic"
+ 	"github.com/google/uuid"
+@@ -1299,6 +1300,10 @@ type Config struct {
+ 	Writer                       *logstore.WriterConfig `json:"writer,omitempty"`
+ 	ObjectStorageEnabled         bool                   `json:"-"`                 // Set by the server from the logstore config; required for retain_content_in_object_storage to take effect
+ 	CaptureClientIP              bool                   `json:"capture_client_ip"` // Set from logs_store.capture_client_ip; off leaves client_ip NULL
++	// MaxMetadataValueBytes caps the byte length of every value captured from logging headers,
++	// x-bf-lh-* labels and x-bf-dim-* dimensions before it is stored in the log row. 0 (the default)
++	// keeps today's behaviour: no cap beyond the server's header read buffer.
++	MaxMetadataValueBytes int `json:"max_metadata_value_bytes,omitempty"`
+ }
+ 
+ func validateWriterConfig(config logstore.WriterConfig) error {
+@@ -1353,6 +1358,7 @@ type LoggerPlugin struct {
+ 	captureClientIP              bool      // logs_store.capture_client_ip; off leaves client_ip NULL
+ 	retainWarnOnce               sync.Once // Warns once when retention is configured without object storage
+ 	loggingHeaders               *[]string // Pointer to live config slice for headers to capture in metadata
++	maxMetadataValueBytes        int       // 0 = unlimited; see Config.MaxMetadataValueBytes
+ 	pricingManager               *modelcatalog.ModelCatalog
+ 	mcpCatalog                   *mcpcatalog.MCPCatalog // MCP catalog for tool cost calculation
+ 	mu                           sync.Mutex
+@@ -1446,6 +1452,7 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, logsStore
+ 		objectStorageEnabled:         config.ObjectStorageEnabled,
+ 		captureClientIP:              config.CaptureClientIP,
+ 		loggingHeaders:               config.LoggingHeaders,
++		maxMetadataValueBytes:        config.MaxMetadataValueBytes,
+ 		done:                         make(chan struct{}),
+ 		logger:                       logger,
+ 		writerConfig:                 writerConfig,
+@@ -1992,9 +1999,28 @@ func (p *LoggerPlugin) captureLoggingHeaders(ctx *schemas.BifrostContext) map[st
+ 	if len(metadata) == 0 {
+ 		return nil
+ 	}
++	if p.maxMetadataValueBytes > 0 {
++		for key, val := range metadata {
++			if str, ok := val.(string); ok {
++				metadata[key] = truncateUTF8(str, p.maxMetadataValueBytes)
++			}
++		}
++	}
+ 	return metadata
+ }
+ 
++// truncateUTF8 returns s cut to at most max bytes without splitting a multi-byte rune.
++func truncateUTF8(s string, max int) string {
++	if len(s) <= max {
++		return s
++	}
++	cut := max
++	for cut > 0 && !utf8.RuneStart(s[cut]) {
++		cut--
++	}
++	return s[:cut]
++}
++
+ // PreRequestHook implements schemas.LLMPlugin (no-op — required for plugin indexing).
+ func (p *LoggerPlugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+ 	return nil
+diff --git a/plugins/logging/metadatasize_test.go b/plugins/logging/metadatasize_test.go
+new file mode 100644
+index 0000000..136ce10
+--- /dev/null
++++ b/plugins/logging/metadatasize_test.go
+@@ -0,0 +1,43 @@
++package logging
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/maximhq/bifrost/core/schemas"
++)
++
++// A caller-controlled x-bf-lh-* label, logging header or dimension must not be able to write an
++// arbitrarily large value into every log row when max_metadata_value_bytes is set.
++func TestCaptureLoggingHeadersCapsValueSize(t *testing.T) {
++	loggingHeaders := []string{"x-custom-*"}
++	plugin := &LoggerPlugin{loggingHeaders: &loggingHeaders, maxMetadataValueBytes: 16}
++	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
++	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
++		"x-bf-lh-blob":   strings.Repeat("A", 60000),
++		"x-bf-lh-short":  "ok",
++		"x-custom-trace": strings.Repeat("B", 100),
++		"x-bf-lh-utf8":   strings.Repeat("é", 20), // 2 bytes per rune: must not be split mid-rune
++	})
++	ctx.SetValue(schemas.BifrostContextKeyDimensions, map[string]string{"region": strings.Repeat("C", 50)})
++
++	got := plugin.captureLoggingHeaders(ctx)
++	for key, val := range got {
++		if s, ok := val.(string); ok && len(s) > 16 {
++			t.Errorf("%s: value of %d bytes exceeds the 16 byte cap", key, len(s))
++		}
++	}
++	if got["short"] != "ok" {
++		t.Fatalf("a value under the cap must be untouched, got %#v", got["short"])
++	}
++	if s := got["utf8"].(string); s != strings.Repeat("é", 8) {
++		t.Fatalf("expected a rune-aligned truncation, got %q", s)
++	}
++
++	unlimited := &LoggerPlugin{}
++	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{"x-bf-lh-blob": strings.Repeat("A", 60000)})
++	if v := unlimited.captureLoggingHeaders(ctx)["blob"].(string); len(v) != 60000 {
++		t.Fatalf("the default (0) must keep today's unlimited behaviour, got %d bytes", len(v))
++	}
++}

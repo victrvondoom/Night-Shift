@@ -78,4 +78,4 @@ if __name__ == "__main__":
         sys.exit(1)
     log.info("demo-api %s starting; database %s:%s", VERSION, DB_HOST, DB_PORT)
     threading.Thread(target=loop, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()  # noqa: S104
+    ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()  # noqa: S104

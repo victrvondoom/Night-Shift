@@ -62,6 +62,7 @@ class EventRow(pw.Schema):
     resource_kind: str
     resource_name: str
     target_app: str
+    run_id: str
 
 
 JSON_PATHS = {
@@ -69,6 +70,7 @@ JSON_PATHS = {
     "resource_kind": "/resource/kind",
     "resource_name": "/resource/name",
     "target_app": "/resource/target_app",
+    "run_id": "/run_id",
 }
 
 
@@ -120,6 +122,7 @@ def build(events: pw.Table) -> pw.Table:
         resource_kind=pw.reducers.min(events.resource_kind),
         resource_name=pw.reducers.min(events.resource_name),
         target_app=pw.reducers.min(events.target_app),
+        run_id=pw.reducers.min(events.run_id),
     )
     uniq = uniq.with_columns(ts=pw.apply(_ts, pw.this.observed_at))
     changes = uniq.filter(pw.this.event_type == "networkpolicy_change")
@@ -128,7 +131,7 @@ def build(events: pw.Table) -> pw.Table:
     )
     win, skew = window_seconds(), skew_seconds()
     pairs = (
-        changes.join(symptoms, changes.namespace == symptoms.namespace)
+        changes.join(symptoms, changes.namespace == symptoms.namespace, changes.run_id == symptoms.run_id)
         .select(
             change_id=changes.event_id,
             change_ts=changes.ts,
@@ -172,6 +175,7 @@ def build(events: pw.Table) -> pw.Table:
         resource=pw.apply(lambda ns, n: f"{ns}/{n}", pw.this.namespace, pw.this.resource_name),
         target_app=pw.this.target_app,
         change_ts=pw.this.ts,
+        run_id=pw.this.run_id,
     )
     joined = base.join_left(grouped, base.change_id == grouped.change_id).select(
         change_id=base.change_id,
@@ -179,6 +183,7 @@ def build(events: pw.Table) -> pw.Table:
         resource=base.resource,
         target_app=base.target_app,
         change_ts=base.change_ts,
+        run_id=base.run_id,
         sym_ids=pw.coalesce(grouped.sym_ids, ()),
         sym_types=pw.coalesce(grouped.sym_types, ()),
         last_ts=pw.coalesce(grouped.last_ts, base.change_ts),
@@ -196,6 +201,7 @@ def build(events: pw.Table) -> pw.Table:
         window_start=pw.apply(_iso, pw.this.change_ts),
         window_end=pw.apply(_iso, pw.this.last_ts),
         window_seconds=win,
+        run_id=pw.this.run_id,
         strength=pw.apply(_strength, pw.this.sym_types),
         explanation=pw.apply(
             lambda r, t, ids, tg: _explain(r, t, len(ids), tg),
@@ -234,10 +240,20 @@ def main() -> None:
 
     from beacon import eventbus
 
+    consumer = os.environ.get("CORRELATOR_CONSUMER", "pathway-correlator")
+
     async def _ensure_stream() -> None:
+        from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy
+
         for attempt in range(30):  # NATS may still be starting
             try:
-                nc, _ = await eventbus.connect()
+                nc, js = await eventbus.connect()
+                # An explicit, pre-created durable pull consumer. Without it Pathway derives the name from its
+                # sources, so two correlator processes would silently SHARE one consumer and split the stream.
+                try:
+                    await js.consumer_info(eventbus.STREAM, consumer)
+                except Exception:
+                    await js.add_consumer(eventbus.STREAM, ConsumerConfig(durable_name=consumer, filter_subject="beacon.events", ack_policy=AckPolicy.EXPLICIT, deliver_policy=DeliverPolicy.ALL))
                 await nc.close()
                 return
             except Exception as exc:
@@ -253,6 +269,7 @@ def main() -> None:
         format="json",
         json_field_paths=JSON_PATHS,
         jetstream_stream_name="BEACON",
+        durable_consumer_name=consumer,
         autocommit_duration_ms=100,
         name="beacon-events",
     )

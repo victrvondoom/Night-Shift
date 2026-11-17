@@ -39,21 +39,46 @@ def api_json(path: str):
 
 
 run("ruff", [PY, "-m", "ruff", "check", "src", "tests", "scripts"], "static")
-run("pytest (unit, contract fakes, Pathway over NATS)", [PY, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"], "contract")
+for _f in ("test_live_providers.py",):
+    _p = subprocess.run([PY, "-m", "pytest", f"tests/{_f}", "-q", "-p", "no:cacheprovider", "-rs"], cwd=ROOT, capture_output=True, text=True)  # noqa: S603
+    _t = (_p.stdout.strip().splitlines() or [""])[-1]
+    add("pytest: LIVE Tavily / Bifrost-provider / OmniDimension calls", "live", "NOT_CONFIGURED" if "skipped" in _t and " passed" not in _t else ("PASS" if _p.returncode == 0 else "FAIL"), _t)
+run("pytest: unit + contract fakes + local NATS/Pathway/OPA/PG integration", [PY, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider", "--ignore=tests/test_live_bifrost.py"], "contract+local")
+p = subprocess.run([PY, "-m", "pytest", "tests/test_live_bifrost.py", "-q", "-p", "no:cacheprovider"], cwd=ROOT, capture_output=True, text=True)  # noqa: S603
+tail = (p.stdout.strip().splitlines() or [""])[-1]
+status = "FAIL" if p.returncode else ("SKIPPED" if " passed" not in tail else "PASS")
+add("pytest: REAL Bifrost gateway process, LOCAL FAKE upstream model (not a live LLM)", "live-gateway", status, tail if status != "SKIPPED" else "no gateway running on :8088 (see docs/HACKATHON.md)")
+run("web unit tests (transcript semantics)", ["npm", "test"], "unit", cwd=ROOT / "web")
 run("web typecheck + build", ["npm", "run", "build"], "static", cwd=ROOT / "web")
 integ = api_json("/api/system/integrations")
 if integ is None:
     add("browser journey", "e2e", "BLOCKED", "stack not running (make demo-up)")
 else:
     root = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True).stdout.strip()  # noqa: S603, S607
-    run("browser journey (DEMO_SIMULATOR)", ["node", "e2e/journey.mjs"], "e2e", env={"NODE_PATH": root})
     state = {r["integration"]: r for r in integ["integrations"]}
+    k8s_mode = state["kubernetes"]["mode"]
+    if k8s_mode.startswith("REAL_CONTROL_PLANE"):
+        run("browser journey: REAL k3s control plane + real Prometheus/Alertmanager + EMULATED data plane (e2e/live_journey.mjs)", ["node", "e2e/live_journey.mjs"], "e2e-k3s", env={"NODE_PATH": root})
+        p = subprocess.run([PY, "-m", "pytest", "tests/test_live_k3s.py", "-q", "-p", "no:cacheprovider"], cwd=ROOT, capture_output=True, text=True)  # noqa: S603
+        tail = (p.stdout.strip().splitlines() or [""])[-1]
+        add("pytest: real k3s API server RBAC matrix, 403s, dry-run, optimistic concurrency, snapshot + context guards", "live-k3s", "PASS" if p.returncode == 0 and " passed" in tail else "FAIL", tail)
+    else:
+        run("browser journey (DEMO_SIMULATOR; NOT a real cluster)", ["node", "e2e/journey.mjs"], "e2e", env={"NODE_PATH": root})
+        add("browser journey on a real k3s control plane", "e2e-k3s", "BLOCKED", f"kubernetes mode is {k8s_mode}; start with DEMO_MODE=k3s make demo-up")
+    if k8s_mode.startswith("REAL_CONTROL_PLANE"):
+        add("browser research journey", "e2e", "BLOCKED", "e2e/research.mjs drives the DEMO_SIMULATOR buttons; run it in sim mode (DEMO_MODE=sim) with the Tavily contract fake")
+    elif state["tavily"]["state"] == "NOT_CONFIGURED":
+        add("browser research journey", "e2e", "BLOCKED", "Tavily not configured; to run against the CONTRACT FAKE: python tests/fixtures/fake_tavily.py & TAVILY_API_KEY=fake TAVILY_API_URL=http://127.0.0.1:9400 make demo-up (not live evidence)")
+    else:
+        run("browser research journey (Tavily endpoint as configured; a contract fake is NOT live evidence)", ["node", "e2e/research.mjs"], "e2e", env={"NODE_PATH": root})
+    add("voice: real OmniDimension session, microphone, barge-in", "live", "BLOCKED", "needs OMNIDIM_API_KEY/OMNIDIM_AGENT_ID and a human with a microphone; manual procedure in docs/PHASE_IV.md")
+    add("execution mode", "info", "PASS", f"temporal={state['temporal']['mode']}/{state['temporal']['state']} kubernetes={state['kubernetes']['mode']}/{state['kubernetes']['state']}")
     for name in ("bifrost", "tavily", "omnidimension"):
         s = state[name]["state"]
         if s == "NOT_CONFIGURED":
             add(f"live {name}", "live", "NOT_CONFIGURED", "credentials absent")
         elif s == "CONNECTED":
-            add(f"live {name}", "live", "PASS", state[name]["detail"])
+            add(f"live {name}", "live", "PASS", f"observed interactions: {state[name]['success_count']} ok / {state[name]['failure_count']} failed")
         else:
             add(f"live {name}", "live", "SKIPPED", f"state {s}: no successful live interaction recorded yet")
     for name in ("nats", "pathway", "opa", "postgresql"):

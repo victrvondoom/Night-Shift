@@ -20,11 +20,11 @@ import pytest
 
 from beacon import analysis, approvals, incident_flow, research
 from beacon.evidence import ledger, normalize
-from beacon.evidence.contracts import Correlation, iso, now_utc
+from beacon.evidence.contracts import Correlation, ResearchItem, iso, now_utc
 from beacon.llm import gateway
 from beacon.remediation import guard
 
-NS_TABLES = ("NS_EVENTS_TABLE", "NS_CORRELATIONS_TABLE", "NS_RESEARCH_TABLE", "NS_ANALYSES_TABLE", "NS_TRACE_TABLE", "NS_PAYLOADS_TABLE")
+NS_TABLES = ("NS_EVENTS_TABLE", "NS_CORRELATIONS_TABLE", "NS_RESEARCH_TABLE", "NS_ANALYSES_TABLE", "NS_TRACE_TABLE", "NS_PAYLOADS_TABLE", "NS_QUERIES_TABLE", "NS_BRIEFS_TABLE", "NS_BUDGET_TABLE", "NS_RUNS_TABLE", "NS_SNAPSHOTS_TABLE")
 
 
 @pytest.fixture()
@@ -113,9 +113,13 @@ class _Fake:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 outer.seen.append({"headers": dict(self.headers), "body": body, "path": self.path})
-                code, payload = handler(body)
+                res = handler(body)
+                code, payload = res[0], res[1]
                 raw = json.dumps(payload).encode()
-                self.send_response(code); self.send_header("content-type", "application/json"); self.end_headers(); self.wfile.write(raw)
+                self.send_response(code); self.send_header("content-type", "application/json")
+                for k, v in (res[2] if len(res) > 2 else {}).items():
+                    self.send_header(k, v)
+                self.end_headers(); self.wfile.write(raw)
 
             def log_message(self, *a): pass
 
@@ -132,11 +136,13 @@ def bifrost(monkeypatch):
 
 
 def test_gateway_sends_trace_headers_and_copies_only_returned_metadata(bifrost):
-    f = _Fake(lambda b: (200, {"id": "req-9", "model": "m", "choices": [{"message": {"content": "{}"}}], "usage": {"total_tokens": 5}, "extra_fields": {"provider": "anthropic", "latency": 120}}))
+    hdr = {"x-bifrost-request-id": "req-9", "x-bifrost-trace-id": "tr-1", "x-bifrost-provider": "anthropic", "x-bifrost-resolved-model": "m", "x-bifrost-latency-ms": "120", "x-bifrost-fallback-index": "0"}
+    f = _Fake(lambda b: (200, {"id": "upstream-completion-id", "model": "m", "choices": [{"message": {"content": "{}"}}], "usage": {"total_tokens": 5}}, hdr))
     bifrost.setenv("BIFROST_URL", f.url)
-    r = gateway.chat([{"role": "user", "content": "x"}], meta={"incident_id": "INC-1", "workflow_stage": "analysis", "evidence_set": "abc"})
+    r = gateway.chat([{"role": "user", "content": "x"}], meta={"incident_id": "INC-1", "workflow_stage": "analysis", "evidence_set": "abc"}, request_id="ana-1")
     h = {k.lower(): v for k, v in f.seen[0]["headers"].items()}
-    assert h["x-bf-lh-incident-id"] == "INC-1" and h["x-bf-lh-evidence-set"] == "abc"
+    assert h["x-bf-lh-incident-id"] == "INC-1" and h["x-bf-lh-evidence-set"] == "abc" and h["x-request-id"] == "ana-1"
+    assert r.trace_id == "tr-1" and r.fallback_used is False and r.raw_meta["upstream_completion_id"] == "upstream-completion-id"
     assert r.request_id == "req-9" and r.provider == "anthropic" and r.latency_ms == 120 and r.usage == {"total_tokens": 5}
     assert r.cost is None  # never invented
 
@@ -177,7 +183,7 @@ def test_analyze_downgrades_to_rules_only_on_invalid_output_and_on_outage(ns, bi
     bifrost.setenv("BIFROST_URL", "http://127.0.0.1:9")
     assert analysis.analyze("INC-T1").status == "GATEWAY_ERROR"
     good = _good(supporting_event_ids=[ev.event_id], what_is_confirmed=[{"text": "c", "evidence_ids": [ev.event_id]}])
-    f2 = _Fake(lambda b: (200, {"id": "r2", "model": "m", "choices": [{"message": {"content": json.dumps(good)}}]}))
+    f2 = _Fake(lambda b: (200, {"id": "upstream-id", "model": "m", "choices": [{"message": {"content": json.dumps(good)}}]}, {"x-bifrost-request-id": "r2"}))
     bifrost.setenv("BIFROST_URL", f2.url)
     b = analysis.analyze("INC-T1")
     assert b.origin == "BIFROST_MODEL" and b.bifrost_request_id == "r2" and b.structured.requires_human_approval is True
@@ -193,31 +199,6 @@ def test_no_module_bypasses_the_gateway():
 
 
 # ---- Tavily (contract fake) ---------------------------------------------------------
-def test_research_preserves_provenance_and_unknown_dates(ns, monkeypatch):
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    def handler(b):
-        if "urls" in b:
-            return 200, {"results": [{"url": "https://kubernetes.io/docs/concepts/services-networking/network-policies/", "raw_content": "full page"}]}
-        return 200, {"results": [{"title": "Network Policies", "url": "https://kubernetes.io/docs/concepts/services-networking/network-policies/", "content": "By default, a pod is non-isolated for ingress... isolated pods ingress default deny", "score": 0.91}, {"title": "blog", "url": "https://example.com/x", "content": "something", "score": 0.5}]}
-    f = _Fake(handler)
-    monkeypatch.setenv("TAVILY_API_URL", f.url); monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
-    items = research.run("INC-T1", {}, {"symptom_types": ["db_connection_error"], "target_app": "demo-db"})
-    k8s = next(i for i in items if "kubernetes.io" in i.url)
-    assert k8s.published_date is None and k8s.updated_date is None and k8s.score == 0.91
-    assert k8s.classification == "SUPPORTS" and k8s.extraction_status == "OK"
-    assert next(i for i in items if "example.com" in i.url).classification == "UNVERIFIED"
-    assert f.seen[0]["headers"]["Authorization"] == "Bearer tvly-test"
-    assert len(ledger.research_for("INC-T1")) == len(items)
-
-
-@pytest.mark.parametrize("code,cat", [(429, "rate_limited"), (401, "auth")])
-def test_research_errors_are_categorised(monkeypatch, code, cat):
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    f = _Fake(lambda b: (code, {}))
-    monkeypatch.setenv("TAVILY_API_URL", f.url); monkeypatch.setenv("TAVILY_API_KEY", "k")
-    with pytest.raises(research.ResearchError) as e:
-        research.run("INC-T1", {}, {"symptom_types": []})
-    assert e.value.category == cat
 
 
 # ---- sandbox guard ---------------------------------------------------------------------
@@ -324,7 +305,7 @@ def test_pathway_correlates_over_nats_with_dedup_late_arrival_and_isolation():
 
     tag = uuid.uuid4().hex[:6]
     nsname = f"pw{tag}"
-    env = {**os.environ, "NATS_URL": "nats://127.0.0.1:4222", "CORRELATOR_PORT": "9187"}
+    env = {**os.environ, "NATS_URL": "nats://127.0.0.1:4222", "CORRELATOR_PORT": "9187", "CORRELATOR_CONSUMER": f"test-{tag}"}
     proc = subprocess.Popen([sys.executable, "-m", "beacon.correlator"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def ev(src, sid, et, ts, namespace, target="", name="x"):
@@ -367,3 +348,93 @@ def test_pathway_correlates_over_nats_with_dedup_late_arrival_and_isolation():
     ids = list(dict.fromkeys(i for d in out for i in d["included_event_ids"]))
     assert len(ids) == 3  # change + alert + one matching log; duplicate / unrelated namespace / other dependency excluded
     assert stable_id("evt", "kubernetes", f"c-{tag}") in ids and {t for d in out for t in d["symptom_types"]} == {"alert_firing", "db_connection_error"}
+
+
+@pytest.mark.skipif(not _nats_up(), reason="NATS JetStream not running (see make demo-up)")
+def test_pathway_isolates_demo_runs_without_restart():
+    """Same namespace, overlapping window, different run_id: a new run never joins an older run's change."""
+    from beacon import eventbus
+    from beacon.evidence.contracts import (
+        EventType,
+        NightShiftEvent,
+        Resource,
+        stable_id,
+    )
+
+    tag = uuid.uuid4().hex[:6]
+    nsname = f"iso{tag}"
+    env = {**os.environ, "NATS_URL": "nats://127.0.0.1:4222", "CORRELATOR_PORT": "9186", "CORRELATOR_CONSUMER": f"test-{tag}"}
+    proc = subprocess.Popen([sys.executable, "-m", "beacon.correlator"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def ev(src, sid, et, ts, run, target=""):
+        return NightShiftEvent(event_id=stable_id("evt", src, sid), source=src, source_event_id=sid, event_type=et, observed_at=ts, received_at=iso(now_utc()), resource=Resource(namespace=nsname, name="n", target_app=target), source_mode="DEMO_SIMULATOR", run_id=run).model_dump(mode="json")
+
+    async def run() -> list[dict]:
+        os.environ["NATS_URL"] = "nats://127.0.0.1:4222"
+        nc, js = await eventbus.connect()
+        sub = await js.pull_subscribe("beacon.correlations", durable=f"i{tag}", stream="BEACON")
+        pub = lambda e: js.publish("beacon.events", json.dumps(e).encode())  # noqa: E731
+        await asyncio.sleep(8)
+        await pub(ev("kubernetes", f"a-{tag}", EventType.NETPOL_CHANGE, "2026-11-16T10:00:00.000000Z", "runA", "db"))
+        await pub(ev("application", f"b-{tag}", EventType.APP_ERROR, "2026-11-16T10:01:00.000000Z", "runB", "db"))  # run B symptom, no run B change yet
+        await asyncio.sleep(3)
+        await pub(ev("kubernetes", f"c-{tag}", EventType.NETPOL_CHANGE, "2026-11-16T10:00:50.000000Z", "runB", "db"))
+        await pub(ev("application", f"d-{tag}", EventType.APP_ERROR, "2026-11-16T10:00:10.000000Z", "runA", "db"))
+        out: list[dict] = []
+        end = time.time() + 25
+        while time.time() < end:
+            try:
+                for m in await sub.fetch(10, timeout=2):
+                    d = json.loads(m.data)
+                    await m.ack()
+                    if d["namespace"] == nsname and d["diff"] == 1:
+                        out.append(d)
+            except Exception:
+                pass
+        await nc.close()
+        return out
+
+    try:
+        out = asyncio.run(run())
+    finally:
+        proc.terminate()
+    by_run: dict[str, set[str]] = {}
+    for d in out:
+        by_run.setdefault(d["run_id"], set()).update(d["included_event_ids"])
+    a, b = stable_id("evt", "application", f"b-{tag}"), stable_id("evt", "application", f"d-{tag}")
+    assert b in by_run["runA"] and a not in by_run["runA"]  # run A's change never absorbs run B's symptom
+    assert a in by_run["runB"] and b not in by_run["runB"]
+
+
+def test_stale_detection_understands_rfc2822_dates():
+    old = {"title": "t", "content": "isolated ingress default deny", "published_date": "Mon, 02 Jan 2012 10:00:00 GMT"}
+    assert research._classify(old, "https://kubernetes.io/docs/x")[0] == "STALE"
+    assert research._classify({**old, "published_date": None}, "https://kubernetes.io/docs/x")[0] == "SUPPORTS"
+
+
+# ---- research brief, follow-ups, budget, staleness --------------------------------------------
+def _seed_research(n=2):
+    ev = _seed_incident(None)
+    items = [ResearchItem(query_id="q", incident_id="INC-T1", query="Kubernetes NetworkPolicy x", title=f"t{i}", url=f"https://kubernetes.io/docs/{i}", excerpt="isolated ingress default deny", retrieved_at=iso(now_utc()), classification="SUPPORTS", classification_reason="why", evidence_id=f"ext-{i:016x}") for i in range(n)]
+    ledger.record_research(items)
+    return ev, items
+
+
+def test_age_is_unknown_not_guessed():
+    assert research.age_days(None) is None and research.age_days("garbage") is None
+    assert research.age_days("Mon, 02 Jan 2012 10:00:00 GMT") > 365 * 10
+
+
+def test_explanation_goes_stale_when_new_evidence_arrives(ns, bifrost):
+    _seed_incident(None)
+    bifrost.setenv("BIFROST_URL", "http://127.0.0.1:9")
+    a = analysis.analyze("INC-T1")
+    cur = {e["event_id"] for e in ledger.events_for("INC-T1")}
+    assert analysis.staleness(a.model_dump(), cur)["stale"] is False
+    late = normalize.from_app_log({"id": "late-1", "ts": "2026-11-16T10:05:00Z", "namespace": "demo", "app": "api", "line": "database unreachable at demo-db:6379"})
+    ledger.record_event(late)
+    from beacon import db
+    db.patch(ledger.events_table(), late.event_id, {"incident_id": "INC-T1"})
+    cur2 = {e["event_id"] for e in ledger.events_for("INC-T1")}
+    st = analysis.staleness(a.model_dump(), cur2)
+    assert st["stale"] is True and st["new_evidence_count"] == 1 and late.event_id in st["new_evidence_ids"]

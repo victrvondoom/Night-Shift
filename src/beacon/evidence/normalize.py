@@ -19,6 +19,7 @@ from beacon.evidence.contracts import (
 )
 
 MODE_KEY = "nightshift.io/source-mode"
+RUN_KEY = "nightshift.io/run-id"
 _DB_ERR = re.compile(
     r"(database|db|redis|postgres).{0,40}(unreachable|refused|timed out|timeout)|"
     r"connection (refused|timed out)",
@@ -71,6 +72,7 @@ def from_audit(item: dict[str, Any], *, cluster: str = "") -> NightShiftEvent | 
         summary=f"{verb} {ref.get('resource')} {ns}/{name} by {row['actor_short']}",
         payload_reference=f"audit:{audit_id}",
         source_mode=mode,
+        run_id=str((item.get("annotations") or {}).get(RUN_KEY) or ""),
     )
 
 
@@ -99,6 +101,7 @@ def from_alert(alert: dict[str, Any]) -> NightShiftEvent | None:
         summary=f"{name}: {notes.get('summary') or notes.get('description') or 'firing'}",
         payload_reference=f"alert:{fp}",
         source_mode=_mode(notes.get(MODE_KEY)),
+        run_id=notes.get(RUN_KEY, ""),
         attributes={
             **{k: v for k, v in labels.items() if k in ("alertname", "namespace", "service", "severity", "job", "deployment")},
             **{k: v for k, v in notes.items() if k in ("beacon_health_url", "summary", "description")},
@@ -135,6 +138,7 @@ def from_app_log(rec: dict[str, Any]) -> NightShiftEvent | None:
         summary=line[:240],
         payload_reference=f"log:{sid}",
         source_mode=_mode(rec.get("source_mode")),
+        run_id=str(rec.get("run_id") or ""),
     )
 
 

@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 
 MODE = "DEMO_SIMULATOR"
 MODE_KEY = "nightshift.io/source-mode"
+RUN_KEY = "nightshift.io/run-id"
 NS, POLICY = "demo", "demo-db-ingress"
 GOLDEN_RULE = {
     "from": [{"podSelector": {"matchLabels": {"app": "demo-api"}}}],
@@ -123,7 +124,7 @@ def _audit(verb: str, user: str) -> dict[str, Any]:
         "responseStatus": {"code": 200},
         "requestReceivedTimestamp": _z(now),
         "stageTimestamp": _z(now),
-        "annotations": {MODE_KEY: MODE},
+        "annotations": {MODE_KEY: MODE, RUN_KEY: S.run_id},
     }
 
 
@@ -156,6 +157,7 @@ async def _scenario(gen: int) -> None:
             "target_app": "demo-db",
             "line": "ERROR database unreachable at demo-db:6379: timed out",
             "source_mode": MODE,
+            "run_id": S.run_id,
         }
         await _post("/ingest/app-logs", {"records": [rec]}, "ALERT_WEBHOOK_TOKEN")
         S.emitted["logs"] += 1
@@ -172,6 +174,7 @@ async def _scenario(gen: int) -> None:
                     "description": "database connection errors > 0 over 30s in namespace demo",
                     "beacon_health_url": f"http://127.0.0.1:{os.environ.get('SIM_PORT', '8090')}/app/ready",
                     MODE_KEY: MODE,
+                    RUN_KEY: S.run_id,
                 },
             }
             await _post("/alerts", {"version": "4", "status": "firing", "alerts": [alert]}, "ALERT_WEBHOOK_TOKEN")

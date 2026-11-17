@@ -783,3 +783,8 @@ body { background: var(--grain), var(--bg); }
 .ws button, .ws .btn { padding: 5px 12px; border-radius: 6px; border: 1px solid #555; background: #1f2937; color: #fff; cursor: pointer; text-decoration: none; font-size: .85rem; }
 .ws button.ghost { background: transparent; color: inherit; } .ws button:disabled { opacity: .45; cursor: not-allowed; }
 @media (max-width: 640px) { .ws-kv { grid-template-columns: 1fr; } .ws-table { font-size: .75rem; } }
+
+.ws .rs-COMPLETED, .ws .bs-FRESH, .ws .es-STRONG { color: #1a7f37; } .ws .rs-FAILED, .ws .bs-STALE, .ws .rs-BUDGET_EXHAUSTED, .ws .es-WEAK { color: #b42318; }
+.ws .rs-PARTIAL, .ws .rs-RESEARCHING, .ws .es-MODERATE { color: #9a6700; } .ws .bs-SUPERSEDED, .ws .bs-NEVER, .ws .rs-NOT_STARTED, .ws .es-INSUFFICIENT { opacity: .65; }
+.ws .kd-SOURCE_ESTABLISHED { color: #1a7f37; } .ws .kd-MODEL_INFERENCE { color: #6639ba; } .ws .kd-HYPOTHESIS { color: #9a6700; }
+.ws button.ghost.on { background: #1f2937; color: #fff; }

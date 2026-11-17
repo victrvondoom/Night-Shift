@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from beacon import (
+    auth,
     changes,
     dashboard_api,
     db,
@@ -64,10 +65,11 @@ if _origins:
         CORSMiddleware,
         allow_origins=_origins,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["content-type", "x-beacon-passcode", "x-beacon-user"],
+        allow_headers=["content-type", "x-beacon-passcode", "x-csrf-token"],
     )
 app.include_router(dashboard_api.router, prefix="/api")
 app.include_router(workspace_api.router, prefix="/api")
+app.include_router(auth.router, prefix="/api/auth")
 app.include_router(voice_turn.router, prefix="/voice")
 
 

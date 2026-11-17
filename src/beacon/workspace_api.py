@@ -18,7 +18,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
-from beacon import analysis, incident_flow, integrations, research
+from beacon import analysis, incident_flow, integrations, research, research_plan
 from beacon.dashboard_api import _json, _passcode_ok
 from beacon.evidence import ledger
 
@@ -30,8 +30,11 @@ def _auth(request: Request) -> bool:
     return _passcode_ok(request)
 
 
-def _user(request: Request) -> str:
-    return re.sub(r"[^\w .@-]", "", request.headers.get("x-beacon-user", "engineer"))[:60] or "engineer"
+def _principal(request: Request) -> Any:
+    """The server-derived approver; any X-Beacon-User header is ignored."""
+    from beacon import auth
+
+    return auth.principal(request)
 
 
 @router.get("/system/integrations")
@@ -41,7 +44,9 @@ async def system_integrations() -> Response:
 
 
 @router.get("/ns/incidents")
-async def list_incidents() -> Response:
+async def list_incidents(request: Request) -> Response:
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
     from beacon import db
 
     rows = await asyncio.to_thread(lambda: db.scan(ledger.incidents_table(), "doc ? 'correlation_ids'"))
@@ -50,12 +55,16 @@ async def list_incidents() -> Response:
 
 
 @router.get("/ns/events/recent")
-async def recent_events() -> Response:
+async def recent_events(request: Request) -> Response:
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
     return _json(200, {"events": await asyncio.to_thread(ledger.recent_events, 30)})
 
 
 @router.get("/ns/incidents/{incident_id}")
-async def get_incident(incident_id: str) -> Response:
+async def get_incident(incident_id: str, request: Request) -> Response:
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
     if not _ID.match(incident_id):
         return _json(400, {"error": "bad id"})
     v = await asyncio.to_thread(incident_flow.view, incident_id)
@@ -63,8 +72,10 @@ async def get_incident(incident_id: str) -> Response:
 
 
 @router.get("/ns/incidents/{incident_id}/stream")
-async def stream(incident_id: str, request: Request) -> StreamingResponse:
+async def stream(incident_id: str, request: Request) -> Response:
     """Server-sent events: pushes the full view whenever persisted state changes."""
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
 
     async def gen() -> Any:
         last = ""
@@ -81,13 +92,15 @@ async def stream(incident_id: str, request: Request) -> StreamingResponse:
 
 
 @router.get("/ns/stream")
-async def stream_all(request: Request) -> StreamingResponse:
+async def stream_all(request: Request) -> Response:
     """Server-sent events for the incident list: lets the console discover a new incident live."""
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
 
     async def gen() -> Any:
         last = ""
         while not await request.is_disconnected():
-            data = json.loads((await list_incidents()).body)
+            data = json.loads((await list_incidents(request)).body)
             sig = json.dumps(data, sort_keys=True)
             if sig != last:
                 last = sig
@@ -108,11 +121,35 @@ async def run_research(incident_id: str, request: Request) -> Response:
     v = await asyncio.to_thread(incident_flow.view, incident_id)
     if not v or not v["correlations"]:
         return _json(409, {"error": "no correlation yet; research is derived from the correlated incident"})
+    body: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        body = dict(await request.json())
+    followups: list[str] | None = None
+    if body.get("followups"):
+        # follow-ups run only on this explicit request, and are sanitised AGAIN here (never trusted from storage)
+        if not v.get("research_briefs"):
+            return _json(409, {"error": "no research brief yet; synthesize one first"})
+        ctx = research.build_context(incident_id)
+        proposed = list(v["research_briefs"][-1].get("follow_up_queries") or [])
+        already = {a["query"] for a in v["research_state"]["attempts"]}
+        followups, rejected = research_plan.sanitize_followups(proposed, ctx, already, cap=2)
+        if not followups:
+            return _json(409, {"error": "no valid follow-up queries (all were rejected or already asked)", "rejected": rejected})
     try:
-        items = await asyncio.to_thread(research.run, incident_id, {}, v["correlations"][-1])
+        summary = await asyncio.to_thread(research.execute, incident_id, followups=followups)
     except research.ResearchError as exc:
-        return _json(502, {"error": exc.category, "detail": exc.detail})
-    return _json(200, {"results": len(items)})
+        return _json(409 if exc.category == "run_in_progress" else 502, {"error": exc.category, "detail": exc.detail})
+    return _json(200 if summary["status"] in ("COMPLETED", "PARTIAL", "BUDGET_EXHAUSTED") else 502, summary)
+
+
+@router.post("/ns/incidents/{incident_id}/research/synthesize")
+async def synthesize(incident_id: str, request: Request) -> Response:
+    if not _auth(request):
+        return _json(401, {"error": "passcode required"})
+    br = await asyncio.to_thread(analysis.synthesize_research, incident_id)
+    if br is None:
+        return _json(409, {"error": "no research sources yet; run research first"})
+    return _json(200, br.model_dump(mode="json"))
 
 
 @router.post("/ns/incidents/{incident_id}/analyze")
@@ -139,15 +176,18 @@ async def approve(incident_id: str, fix_id: int, request: Request) -> Response:
     body: dict[str, Any] = {}
     with contextlib.suppress(Exception):
         body = dict(await request.json())
+    who = _principal(request)
     status, out = await asyncio.to_thread(
         lambda: incident_flow.approve(
             incident_id,
             fix_id,
             typed_phrase=str(body.get("typed_phrase", "")),
             params_hash=str(body.get("params_hash", "")),
-            user=_user(request),
+            user=who.id if who else "",
+            auth_method=who.method if who else "",
+            session=who.session if who else "",
             idempotency_key=str(body.get("idempotency_key", "")),
-            authenticated=_auth(request),
+            authenticated=who is not None,
         )
     )
     return _json(status, out)
@@ -157,12 +197,14 @@ async def approve(incident_id: str, fix_id: int, request: Request) -> Response:
 async def cancel(incident_id: str, fix_id: int, request: Request) -> Response:
     if not _auth(request):
         return _json(401, {"error": "passcode required"})
-    status, out = await asyncio.to_thread(incident_flow.cancel, incident_id, fix_id, user=_user(request))
+    status, out = await asyncio.to_thread(incident_flow.cancel, incident_id, fix_id, user=_principal(request).id)
     return _json(status, out)
 
 
 @router.get("/ns/incidents/{incident_id}/report")
-async def get_report(incident_id: str, format: str = "json") -> Response:
+async def get_report(incident_id: str, request: Request, format: str = "json") -> Response:
+    if not _auth(request):
+        return _json(401, {"error": "authentication required"})
     r = await asyncio.to_thread(incident_flow.report, incident_id)
     if r is None:
         return _json(404, {"error": "not found"})
@@ -204,7 +246,7 @@ async def demo_reset(request: Request) -> Response:
     async with httpx.AsyncClient(timeout=5) as c:
         await c.post(f"{_sim()}/sim/reset")
     purged = await _purge_stream()
-    return _json(200, {"reset": True, "demo_records_removed": n, "stream_messages_purged": purged, "note": "Pathway keeps in-memory state; `make demo-reset` also restarts the correlator for a fully clean state"})
+    return _json(200, {"reset": True, "demo_records_removed": n, "stream_messages_purged": purged, "note": "no Pathway restart needed: events carry a run_id and the correlator joins only within one run"})
 
 
 async def _purge_stream() -> int:
@@ -234,9 +276,9 @@ def _purge_demo_data(db: Any) -> int:
             db.delete(table, r["event_id"])
             n += 1
     for iid in ids:
-        for table, col in ((ledger.corr_table(), "incident_id"), (ledger.research_table(), "incident_id"), (ledger.analysis_table(), "incident_id"), (ledger.trace_table(), "incident_id")):
+        for table, col in ((ledger.corr_table(), "incident_id"), (ledger.research_table(), "incident_id"), (ledger.analysis_table(), "incident_id"), (ledger.briefs_table(), "incident_id"), (ledger.queries_table(), "incident_id"), (ledger.snapshots_table(), "incident_id"), (ledger.runs_table(), "incident_id"), (ledger.budget_table(), "incident_id"), (ledger.trace_table(), "incident_id")):
             for r in db.scan(table, f"doc->>'{col}' = %s", (iid,)):
-                key = r.get("correlation_id") or r.get("evidence_id") or r.get("analysis_id") or f"{r['incident_id']}#{r['stage']}#{r['ref']}"
+                key = r.get("correlation_id") or r.get("evidence_id") or r.get("analysis_id") or r.get("brief_id") or r.get("attempt_id") or r.get("snapshot_id") or r.get("run_id") or r["incident_id"] or f"{r['incident_id']}#{r['stage']}#{r['ref']}"
                 db.delete(table, key)
                 n += 1
         for r in db.scan(os.environ.get("APPROVALS_TABLE_NAME", "approvals"), "doc->>'incident_id' = %s", (iid,)):

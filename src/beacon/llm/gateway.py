@@ -39,11 +39,14 @@ class GatewayResult:
     cost: float | None = None
     attempts: int | None = None
     fallback_used: bool | None = None
+    trace_id: str | None = None
+    upstream_latency_ms: float | None = None
+    fallback_index: int | None = None
     raw_meta: dict[str, Any] = field(default_factory=dict)
 
 
 def base_url() -> str:
-    return os.environ.get("BIFROST_URL", "").rstrip("/")
+    return (os.environ.get("BIFROST_URL") or os.environ.get("BIFROST_BASE_URL", "")).rstrip("/")
 
 
 def configured() -> bool:
@@ -63,24 +66,42 @@ def trace_headers(meta: dict[str, str]) -> dict[str, str]:
     return {f"x-bf-lh-{k.replace('_', '-')}": str(v)[:200] for k, v in meta.items() if v}
 
 
-def headers(meta: dict[str, str]) -> dict[str, str]:
+def headers(meta: dict[str, str], request_id: str = "") -> dict[str, str]:
     h = {"content-type": "application/json", **trace_headers(meta)}
+    if request_id:
+        h["x-request-id"] = request_id  # Bifrost echoes it as X-Bifrost-Request-Id (verified against a real gateway)
     vk = os.environ.get("BIFROST_VIRTUAL_KEY", "")
     if vk:
         h["x-bf-vk"] = vk
+    key = os.environ.get("BIFROST_API_KEY", "")
+    if key:
+        h["authorization"] = f"Bearer {key}"
     return h
 
 
+def _timeout() -> float:
+    return float(os.environ.get("BIFROST_TIMEOUT_SECONDS", "60"))
+
+
+def _fnum(v: str | None) -> float | None:
+    try:
+        return float(v) if v not in (None, "") else None
+    except ValueError:
+        return None
+
+
 def _record(ok: bool, category: str = "", detail: str = "") -> None:
+    if category == "not_configured":
+        return  # refused before sending: not an interaction, so never evidence of failure
     try:
         from beacon import health_log
 
-        health_log.record("bifrost", ok, category, detail)
+        health_log.record("bifrost:model_invocation", ok, category, detail)
     except Exception:  # health bookkeeping must never break a request
         logger.debug("health_log failed", exc_info=True)
 
 
-def chat(messages: list[dict[str, str]], *, meta: dict[str, str], json_mode: bool = True, timeout: float = 60.0) -> GatewayResult:
+def chat(messages: list[dict[str, str]], *, meta: dict[str, str], request_id: str = "", json_mode: bool = True, timeout: float | None = None) -> GatewayResult:
     """One chat completion through Bifrost.  Raises ``GatewayError`` with a category."""
     if not configured() or not model():
         _record(False, "not_configured", "BIFROST_URL/BIFROST_MODEL not set")
@@ -92,7 +113,7 @@ def chat(messages: list[dict[str, str]], *, meta: dict[str, str], json_mode: boo
         body["response_format"] = {"type": "json_object"}
     t0 = time.perf_counter()
     try:
-        resp = httpx.post(f"{base_url()}/v1/chat/completions", json=body, headers=headers(meta), timeout=timeout)
+        resp = httpx.post(f"{base_url()}/v1/chat/completions", json=body, headers=headers(meta, request_id), timeout=timeout or _timeout())
     except httpx.TimeoutException as exc:
         _record(False, "timeout", str(exc))
         raise GatewayError("timeout", str(exc)) from exc
@@ -116,18 +137,25 @@ def chat(messages: list[dict[str, str]], *, meta: dict[str, str], json_mode: boo
         _record(False, "invalid_response", "no choices[0].message.content")
         raise GatewayError("invalid_response", "unexpected gateway payload") from exc
     extra = data.get("extra_fields") or {}
+    h = resp.headers
     usage = data.get("usage")
+    fb_idx = h.get("x-bifrost-fallback-index")
+    # Identity/routing facts come from Bifrost's own response headers; the body "id" is the
+    # *upstream provider's* completion id and is not a Bifrost request id.
     result = GatewayResult(
         content=content or "",
-        request_id=str(data.get("id") or "") or None,
-        provider=extra.get("provider") or None,
-        model=data.get("model") or None,
-        latency_ms=int(extra["latency"]) if isinstance(extra.get("latency"), (int, float)) else (elapsed if False else None),
+        request_id=h.get("x-bifrost-request-id") or None,
+        trace_id=h.get("x-bifrost-trace-id") or None,
+        provider=h.get("x-bifrost-provider") or extra.get("provider") or None,
+        model=h.get("x-bifrost-resolved-model") or data.get("model") or None,
+        latency_ms=int(v) if (v := _fnum(h.get("x-bifrost-latency-ms"))) is not None else (int(extra["latency"]) if isinstance(extra.get("latency"), (int, float)) else None),
+        upstream_latency_ms=_fnum(h.get("x-bifrost-upstream-latency-ms")),
         usage={k: int(v) for k, v in usage.items() if isinstance(v, (int, float))} if isinstance(usage, dict) else None,
         cost=float(extra["cost"]) if isinstance(extra.get("cost"), (int, float)) else None,
-        attempts=int(extra["number_of_retries"]) + 1 if isinstance(extra.get("number_of_retries"), int) else None,
-        fallback_used=(extra.get("fallback_index", 0) or 0) > 0 if "fallback_index" in extra else None,
-        raw_meta={"observed_wall_ms": elapsed, "extra_fields_keys": sorted(extra)},
+        attempts=None,
+        fallback_index=int(fb_idx) if fb_idx and fb_idx.isdigit() else None,
+        fallback_used=(int(fb_idx) > 0) if fb_idx and fb_idx.isdigit() else (h.get("x-bifrost-routing-info-is-fallback", "").lower() == "true" if "x-bifrost-routing-info-is-fallback" in h else None),
+        raw_meta={"observed_wall_ms": elapsed, "upstream_completion_id": data.get("id")},
     )
     _record(True)
     return result

@@ -116,7 +116,7 @@ class StepWorkflow:
         )
 
 
-_SYNC_STEPS = frozenset({"dryrun"})
+_SYNC_STEPS = frozenset({"dryrun", "diagnose"})
 
 
 async def _run_step(step: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +190,22 @@ def start_remediation(payload: dict[str, Any]) -> str:
 
         remediate.handler({**payload, "step": "all"}, None)
         return f"inline-{payload['approval_id']}"
-    return asyncio.run(_start(payload))
+    try:
+        wid = asyncio.run(_start(payload))
+    except Exception as exc:
+        _health(False, type(exc).__name__)
+        raise
+    _health(True)
+    return wid
+
+
+def _health(ok: bool, category: str = "") -> None:
+    try:
+        from beacon import health_log
+
+        health_log.record("temporal:workflow", ok, category)
+    except Exception:  # bookkeeping must never break remediation
+        pass
 
 
 def describe(execution_id: str) -> dict[str, Any]:

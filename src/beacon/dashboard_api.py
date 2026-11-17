@@ -7,7 +7,6 @@ mutation is revoking a Sleep Contract, which needs the passcode.
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 import os
@@ -22,7 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
-from beacon import contracts, prom, reports, secrets, store
+from beacon import contracts, prom, reports, store
 from beacon.remediation import registry
 
 logger = logging.getLogger(__name__)
@@ -136,11 +135,9 @@ def _json(status: int, body: dict[str, Any]) -> Response:
 
 
 def _passcode_ok(request: Request) -> bool:
-    expected = secrets.get("PASSCODE")
-    given = request.headers.get("x-beacon-passcode", "")
-    return bool(expected and given) and hmac.compare_digest(
-        given.encode(), expected.encode()
-    )
+    from beacon import auth
+
+    return auth.principal(request) is not None
 
 
 # A bare 12-digit number that is not part of a UUID or hex id (cloud account ids

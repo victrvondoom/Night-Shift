@@ -477,6 +477,7 @@ def run_all(event: dict[str, Any]) -> dict[str, Any]:
 
 
 _STEPS = {
+    "diagnose": lambda e: diagnose_step(e),
     "dryrun": dryrun,
     "require_approval": require_approval,
     "execute": execute,
@@ -512,6 +513,19 @@ def _emit_outcome_metrics(
         observability.metric("Resolved", 1, unit="Count")
     if step == "escalate":
         observability.metric("Escalated", 1, unit="Count")
+
+
+def diagnose_step(event: dict[str, Any]) -> dict[str, Any]:
+    """Read-only, deterministic: live NetworkPolicy drift vs the golden snapshot, run by the WORKER (the API holds no cluster credentials)."""
+    from beacon import diagnose
+    from beacon.remediation import actions_netpol
+
+    try:
+        golden = actions_netpol.load_golden_snapshot() or {}
+        result = diagnose.run(golden)
+    except Exception as exc:
+        return {"ok": False, "error": f"diagnostics failed: {type(exc).__name__}: {exc}"}
+    return {"ok": True, "suggested_action": result.get("suggested_action"), "action_params": result.get("action_params"), "missing_rules": result.get("missing_rules"), "golden_targets": sorted(golden)}
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:

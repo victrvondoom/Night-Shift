@@ -22,6 +22,7 @@ _IDENT = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _lock = threading.Lock()
 _pool: ConnectionPool | None = None
 _ready: set[str] = set()
+_ensure_lock = threading.RLock()
 
 
 def dsn() -> str:
@@ -60,18 +61,37 @@ def reset() -> None:
 def _ensure(name: str) -> str:
     name = table(name)
     if name not in _ready:
-        with pool().connection() as conn:
-            conn.execute(
-                f"CREATE TABLE IF NOT EXISTS {name} ("
-                "id text PRIMARY KEY, doc jsonb NOT NULL, "
-                "created_at timestamptz NOT NULL DEFAULT now())"
-            )
-            conn.execute(
-                f"CREATE INDEX IF NOT EXISTS {name}_doc_gin ON {name} "
-                "USING gin (doc jsonb_path_ops)"
-            )
-        _ready.add(name)
+        import psycopg.errors as pge
+
+        with _ensure_lock:
+            if name in _ready:
+                return name
+            _create(name, pge)
     return name
+
+
+def _create(name: str, pge: Any) -> None:
+
+    # Two processes/threads creating the same table at the same instant can raise UniqueViolation or
+    # DuplicateTable from the catalog even with IF NOT EXISTS; the table exists afterwards, so retry once.
+    for attempt in (1, 2):
+        try:
+            with pool().connection() as conn:
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (name,))
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {name} ("
+                    "id text PRIMARY KEY, doc jsonb NOT NULL, "
+                    "created_at timestamptz NOT NULL DEFAULT now())"
+                )
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {name}_doc_gin ON {name} "
+                    "USING gin (doc jsonb_path_ops)"
+                )
+            break
+        except (pge.UniqueViolation, pge.DuplicateTable, pge.DuplicateObject):
+            if attempt == 2:
+                raise
+    _ready.add(name)
 
 
 def _plain(value: Any) -> Any:

@@ -4,6 +4,7 @@ metadata: {name: beacon-env, namespace: beacon}
 data:
   LOG_FORMAT: cri
   NATS_URL: nats://nats:4222
+  CORRELATOR_URL: http://beacon-correlator:9103
   TEMPORAL_ADDRESS: temporal:7233
   OPA_URL: http://opa:8181
   PROMETHEUS_URL: http://prometheus:9090
@@ -25,7 +26,7 @@ data:
   DASHBOARD_URL: http://localhost:30080
   APPLY_ENABLED: "true"
   LITELLM_LOCAL_MODEL_COST_MAP: "True"
-  NO_PROXY: "localhost,127.0.0.1,.svc,.cluster.local,postgres,nats,temporal,opa,prometheus,loki,ollama,vault,minio,otel-collector,beacon-api,10.0.0.0/8"
+  NO_PROXY: "localhost,127.0.0.1,.svc,.cluster.local,postgres,nats,temporal,opa,prometheus,loki,ollama,vault,minio,otel-collector,beacon-api,beacon-correlator,10.0.0.0/8"
 ---
 apiVersion: apps/v1
 kind: Deployment
