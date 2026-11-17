@@ -12,7 +12,7 @@ import { Contracts } from "./components/Contracts";
 import { Safety } from "./components/Safety";
 import { Talk } from "./components/Talk";
 import { Workspace } from "./workspace/Workspace";
-import { useClock, useLocalState, usePoll } from "./hooks";
+import { useClock, usePoll } from "./hooks";
 import { useNavIndicator, useReveal, useScrolled, useCursorMotion } from "./motion";
 import { loadReplay, type ReplayBundle } from "./replay";
 import { computeAnalytics } from "./analytics";
@@ -60,7 +60,24 @@ const trimSlashApi = (u: string) => (u.endsWith("/") ? u.slice(0, -1) : u);
 export default function App() {
   const [config, setConfig] = useState<Config | null>(null);
   const [replay, setReplay] = useState<ReplayBundle | null>(null);
-  const [passcode, setPasscode] = useLocalState("beacon.passcode", "");
+  // Server-side session: the passcode is exchanged ONCE for an HttpOnly cookie; only the CSRF token lives here, in memory.
+  // Nothing is written to browser storage. `passcode` is truthy while signed in.
+  const [passcode, setCsrf] = useState("");
+  const setPasscode = (raw: string) => {
+    if (!raw) return setCsrf("");
+    void fetch("/api/auth/login", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ passcode: raw }) })
+      .then(async (r) => {
+        const d = (await r.json().catch(() => ({}))) as { csrf_token?: string; error?: string };
+        if (r.ok && d.csrf_token) setCsrf(d.csrf_token);
+        else toast(d.error ?? "sign-in failed", "info");
+      })
+      .catch(() => toast("sign-in failed: API unreachable", "info"));
+  };
+  useEffect(() => {
+    void fetch("/api/auth/me", { credentials: "same-origin" }).then(async (r) => {
+      if (r.ok) setCsrf(((await r.json()) as { csrf_token: string }).csrf_token);
+    });
+  }, []);
   // The live OmniDimension call or the push-to-talk console, per browser.
   const [route, deepId] = useRoute();
   const [filter, setFilter] = useState<"all" | "needs" | "progress" | "resolved" | "contract">("all");
@@ -285,7 +302,7 @@ export default function App() {
 
   const runNight = async () => {
     if (!localApi || !config) return;
-    if (!passcode) setPasscode(config.localPasscode);
+    if (!passcode && config.localPasscode) setPasscode(config.localPasscode);
     setPinned(false);
     setOpenId(null);
     const newest = incidents[0];
@@ -410,7 +427,7 @@ export default function App() {
                   e.preventDefault();
                   const v = (new FormData(e.currentTarget).get("passcode") as string) ?? "";
                   setPasscode(v.trim());
-                  if (v.trim()) toast("Passcode saved for this tab", "ok");
+                  if (v.trim()) toast("Signing in…", "ok");
                 }}
               >
                 <div className="row">
@@ -418,7 +435,7 @@ export default function App() {
                   <button className="btn primary" type="submit">
                     Unlock voice
                   </button>
-                  <span className="faint small">reads are public · talking and approving need the passcode</span>
+                  <span className="faint small">the passcode is exchanged for a server-side session; it is never stored in this browser</span>
                 </div>
               </form>
             ) : null}
@@ -512,7 +529,7 @@ export default function App() {
         </main>
       ) : route === "workspace" ? (
         <main key="workspace" className="main route-in">
-          {config ? <Workspace base={trimSlashApi(config.dashboardUrl)} voiceBase={trimSlashApi(config.voiceUrl)} passcode={passcode} setPasscode={setPasscode} incidentId={deepId} /> : null}
+          {config ? <Workspace base={trimSlashApi(config.dashboardUrl)} voiceBase={trimSlashApi(config.voiceUrl)} incidentId={deepId} /> : null}
         </main>
       ) : route === "analytics" ? (
         <main key="analytics" className="main route-in">
@@ -538,13 +555,11 @@ export default function App() {
             onSummarise={
               api && config
                 ? (sid, incidentId) => {
-                    let code = passcode;
-                    if (!code) {
-                      code = window.prompt("Passcode (the summary is produced through the Night Shift API)") ?? "";
-                      if (!code) return Promise.resolve(null);
-                      setPasscode(code);
+                    if (!passcode) {
+                      toast("Unlock first with the passcode", "info");
+                      return Promise.resolve(null);
                     }
-                    return makeApi(config, () => code)
+                    return api
                       .sessionSummary(sid, incidentId)
                       .then((r) => r.summary || null)
                       .catch(() => null);
@@ -554,13 +569,11 @@ export default function App() {
             onAttest={
               api && config
                 ? (sid, incidentId) => {
-                    let code = passcode;
-                    if (!code) {
-                      code = window.prompt("Passcode (the check runs through the Night Shift API)") ?? "";
-                      if (!code) return Promise.resolve(null);
-                      setPasscode(code);
+                    if (!passcode) {
+                      toast("Unlock first with the passcode", "info");
+                      return Promise.resolve(null);
                     }
-                    return makeApi(config, () => code)
+                    return api
                       .sessionAttest(sid, incidentId)
                       .catch(() => null);
                   }
@@ -569,14 +582,11 @@ export default function App() {
             onListen={
               api
                 ? (id) => {
-                    let code = passcode;
-                    if (!code) {
-                      code = window.prompt("Passcode (the recording is fetched through the Night Shift API)") ?? "";
-                      if (!code) return Promise.resolve(null);
-                      setPasscode(code);
+                    if (!passcode) {
+                      toast("Unlock first with the passcode", "info");
+                      return Promise.resolve(null);
                     }
-                    const fresh = config ? makeApi(config, () => code) : api;
-                    return fresh.recording(id).then((r) => r.audio_url ?? null).catch(() => null);
+                    return api.recording(id).then((r) => r.audio_url ?? null).catch(() => null);
                   }
                 : undefined
             }

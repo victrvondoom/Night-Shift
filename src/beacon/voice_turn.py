@@ -74,8 +74,9 @@ def _eq(given: str, expected: str) -> bool:
 
 
 def _passcode_ok(request: Request) -> bool:
-    """Constant-time compare; an unset passcode fails closed."""
-    return _eq(request.headers.get("x-beacon-passcode", ""), secrets.get("PASSCODE"))
+    from beacon import auth
+
+    return auth.principal(request) is not None
 
 
 def _now() -> datetime:
@@ -644,6 +645,13 @@ async def omnidim_events(session_id: str, request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _health(key: str, ok: bool, category: str = "") -> None:
+    """Browser-reported SDK events are interactions observed by the console, recorded as such."""
+    from beacon import health_log
+
+    health_log.record(key, ok, category)
+
+
 @router.post("/omnidim/session/{session_id}/transcript")
 async def omnidim_transcript(session_id: str, request: Request) -> JSONResponse:
     """The console stores *final* transcript turns (the SDK emits cumulative snapshots).
@@ -661,6 +669,7 @@ async def omnidim_transcript(session_id: str, request: Request) -> JSONResponse:
     if body.get("final") is not True or not text:
         return _json(200, {"stored": False, "reason": "only final, non-empty turns are stored"})
     db.append(_CALLS, session_id, "transcript", {"t": _now().isoformat(), "role": role, "text": text})
+    _health("omnidimension:transcript", True)
     return _json(200, {"stored": True})
 
 
@@ -675,6 +684,10 @@ async def omnidim_status(session_id: str, request: Request) -> JSONResponse:
     body = dict(await request.json())
     state = str(body.get("state") or "")[:40]
     db.patch(_CALLS, session_id, {"status": state, "end_reason": str(body.get("reason") or "")[:80], "updated_at": _now().isoformat()})
+    if state == "active":
+        _health("omnidimension:browser_connected", True)
+    elif state == "error":
+        _health("omnidimension:browser_connected", False, "browser_error")
     if state in ("active", "ended") and row.get("incident_id"):
         store.append_timeline(str(row["incident_id"]), f"voice_session_{state}", table_name=_incidents_table(), detail={"session_id": session_id, "reason": str(body.get("reason") or "")})
     return _json(200, {"ok": True})

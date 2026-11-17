@@ -15,6 +15,7 @@ from beacon.evidence.contracts import (
     Correlation,
     ModelAnalysis,
     NightShiftEvent,
+    ResearchBrief,
     ResearchItem,
     iso,
     now_utc,
@@ -41,6 +42,135 @@ def research_table() -> str:
 
 def analysis_table() -> str:
     return _t("NS_ANALYSES_TABLE", "ns_analyses")
+
+
+def queries_table() -> str:
+    return _t("NS_QUERIES_TABLE", "ns_queries")
+
+
+def budget_table() -> str:
+    return _t("NS_BUDGET_TABLE", "ns_research_budget")
+
+
+def runs_table() -> str:
+    return _t("NS_RUNS_TABLE", "ns_research_runs")
+
+
+def snapshots_table() -> str:
+    return _t("NS_SNAPSHOTS_TABLE", "ns_snapshots")
+
+
+def budget_limits() -> tuple[int, float]:
+    """(max external operations, max credits) per incident; every search, extract AND retry is one operation."""
+    return int(os.environ.get("TAVILY_MAX_QUERIES_PER_INCIDENT", "8")), float(os.environ.get("TAVILY_MAX_CREDITS_PER_INCIDENT", "16"))
+
+
+def reserve(incident_id: str, op: str, est_credits: float) -> dict[str, Any] | None:
+    """Atomically reserve one external operation. Returns the budget row, or None when the budget is exhausted.
+
+    One conditional UPDATE decides, so N concurrent callers can never overspend. The reservation is made
+    BEFORE the request and is never refunded: failures, zero-result searches and retries all consume budget.
+    """
+    max_ops, max_credits = budget_limits()
+    t = db._ensure(budget_table())
+    fresh = {"incident_id": incident_id, "operations_used": 0, "credits_reserved": 0.0, "credits_reported": 0.0, "max_operations": max_ops, "max_credits": max_credits, "created_at": iso(now_utc())}
+    from psycopg.types.json import Jsonb
+
+    with db.pool().connection() as conn:
+        conn.execute(f"INSERT INTO {t} (id, doc) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING", (incident_id, Jsonb(fresh)))
+        row = conn.execute(
+            f"UPDATE {t} SET doc = jsonb_set(jsonb_set(doc, '{{operations_used}}', to_jsonb((doc->>'operations_used')::int + 1)), "
+            "'{credits_reserved}', to_jsonb((doc->>'credits_reserved')::numeric + %s)) "
+            "WHERE id = %s AND (doc->>'operations_used')::int < %s AND (doc->>'credits_reserved')::numeric + %s <= %s RETURNING doc",
+            (est_credits, incident_id, max_ops, est_credits, max_credits),
+        ).fetchone()
+    return dict(row[0]) if row else None
+
+
+def settle(incident_id: str, est_credits: float, actual_credits: float | None) -> None:
+    """Replace the estimate with the provider-reported credits when the provider reported them."""
+    if actual_credits is None:
+        return
+    t = db._ensure(budget_table())
+    with db.pool().connection() as conn:
+        conn.execute(
+            f"UPDATE {t} SET doc = jsonb_set(jsonb_set(doc, '{{credits_reserved}}', to_jsonb((doc->>'credits_reserved')::numeric + %s)), "
+            "'{credits_reported}', to_jsonb((doc->>'credits_reported')::numeric + %s)) WHERE id = %s",
+            (actual_credits - est_credits, actual_credits, incident_id),
+        )
+
+
+def budget_for(incident_id: str) -> dict[str, Any]:
+    max_ops, max_credits = budget_limits()
+    row = db.get(budget_table(), incident_id) or {}
+    used = int(row.get("operations_used", 0))
+    return {
+        "operations_used": used,
+        "max_operations": max_ops,
+        "operations_remaining": max(0, max_ops - used),
+        "credits_reserved": float(row.get("credits_reserved", 0)),
+        "credits_reported": float(row.get("credits_reported", 0)),
+        "max_credits": max_credits,
+        "exhausted": used >= max_ops or float(row.get("credits_reserved", 0)) >= max_credits,
+    }
+
+
+def record_attempt(incident_id: str, attempt_id: str, **fields: Any) -> None:
+    """One row per external attempt (search/extract, success or failure, original or retry)."""
+    db.put(queries_table(), attempt_id, {"incident_id": incident_id, "attempt_id": attempt_id, "sent_at": iso(now_utc()), **fields})
+
+
+def queries_for(incident_id: str) -> list[dict[str, Any]]:
+    rows = db.scan(queries_table(), "doc->>'incident_id' = %s", (incident_id,))
+    return sorted(rows, key=lambda r: str(r.get("sent_at")))
+
+
+def acquire_run(incident_id: str, kind: str, ttl_s: int = 180) -> str | None:
+    """Single in-flight research run per incident (concurrent follow-ups are refused, not interleaved)."""
+    from datetime import timedelta
+
+    key = f"{incident_id}#lock"
+    now = now_utc()
+    doc = {"incident_id": incident_id, "lock": True, "kind": kind, "started_at": iso(now), "expires_at": iso(now + timedelta(seconds=ttl_s))}
+    if db.insert(runs_table(), key, doc):
+        return key
+    t = db._ensure(runs_table())
+    from psycopg.types.json import Jsonb
+
+    with db.pool().connection() as conn:
+        got = conn.execute(f"UPDATE {t} SET doc = %s WHERE id = %s AND doc->>'expires_at' < %s", (Jsonb(doc), key, iso(now))).rowcount
+    return key if got == 1 else None
+
+
+def release_run(key: str) -> None:
+    db.delete(runs_table(), key)
+
+
+def record_run(incident_id: str, run_id: str, **fields: Any) -> None:
+    db.put(runs_table(), run_id, {"incident_id": incident_id, "run_id": run_id, "recorded_at": iso(now_utc()), **fields})
+
+
+def runs_for(incident_id: str) -> list[dict[str, Any]]:
+    rows = [r for r in db.scan(runs_table(), "doc->>'incident_id' = %s", (incident_id,)) if not r.get("lock")]
+    return sorted(rows, key=lambda r: str(r.get("recorded_at")))
+
+
+def active_run(incident_id: str) -> dict[str, Any] | None:
+    row = db.get(runs_table(), f"{incident_id}#lock")
+    return row if row and str(row.get("expires_at", "")) > iso(now_utc()) else None
+
+
+def record_snapshot(snap: dict[str, Any]) -> bool:
+    """Immutable: insert-only. A snapshot is never updated, so a brief always points at exactly what it saw."""
+    return db.insert(snapshots_table(), snap["snapshot_id"], snap)
+
+
+def get_snapshot(snapshot_id: str) -> dict[str, Any] | None:
+    return db.get(snapshots_table(), snapshot_id)
+
+
+def briefs_table() -> str:
+    return _t("NS_BRIEFS_TABLE", "ns_briefs")
 
 
 def trace_table() -> str:
@@ -122,6 +252,8 @@ def attach_remediation_event(ev: NightShiftEvent) -> None:
     ]
     if not rows:
         return
+    if ev.run_id:
+        rows = [r for r in rows if r.get("run_id") == ev.run_id] or rows
     target = max(rows, key=lambda r: str(r.get("detected_at")))
     db.patch(events_table(), ev.event_id, {"incident_id": target["incident_id"]})
     trace(target["incident_id"], "remediation_event", ev.event_id, {"source": ev.source})
@@ -141,6 +273,8 @@ def record_correlation(corr: Correlation, *, nats_subject: str = "beacon.correla
     db.put(corr_table(), corr.correlation_id, row)
     for eid in corr.included_event_ids:
         db.patch(events_table(), eid, {"incident_id": corr.incident_id})
+    if corr.strength == "CHANGE_ONLY_NO_SYMPTOM":
+        return changed  # a policy edit with no symptom is recorded as a correlation, but is not an incident
     _ensure_incident(corr)
     if changed:
         trace(
@@ -173,6 +307,7 @@ def _ensure_incident(corr: Correlation) -> None:
         "source_mode": mode,
         "correlation_ids": [corr.correlation_id],
         "detected_at": detected,
+        "run_id": corr.run_id,
         "affected_service": attrs.get("service") or corr.target_app,
         "severity": "critical" if alert else "warning",
     }
@@ -225,4 +360,14 @@ def record_analysis(a: ModelAnalysis) -> None:
 
 def analyses_for(incident_id: str) -> list[dict[str, Any]]:
     rows = db.scan(analysis_table(), "doc->>'incident_id' = %s", (incident_id,))
+    return sorted(rows, key=lambda r: str(r["created_at"]))
+
+
+def record_brief(br: ResearchBrief) -> None:
+    db.put(briefs_table(), br.brief_id, br.model_dump(mode="json"))
+    trace(br.incident_id, "bifrost_request", br.bifrost_request_id or br.brief_id, {"purpose": "external_research_synthesis", "origin": br.origin, "status": br.status})
+
+
+def briefs_for(incident_id: str) -> list[dict[str, Any]]:
+    rows = db.scan(briefs_table(), "doc->>'incident_id' = %s", (incident_id,))
     return sorted(rows, key=lambda r: str(r["created_at"]))

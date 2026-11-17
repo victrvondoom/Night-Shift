@@ -13,12 +13,12 @@ const TURN_TIMEOUT_MS = 50_000;
 
 async function request<T>(url: string, init: RequestInit = {}, passcode?: string, timeoutMs = READ_TIMEOUT_MS): Promise<T> {
   const headers: Record<string, string> = { "content-type": "application/json", ...(init.headers as Record<string, string>) };
-  if (passcode) headers["x-beacon-passcode"] = passcode;
+  if (passcode) headers["x-csrf-token"] = passcode; // the CSRF token of the server-side session (cookie carries the credential)
   const ctl = new AbortController();
   const timer = window.setTimeout(() => ctl.abort(), timeoutMs);
   let resp: Response;
   try {
-    resp = await fetch(url, { ...init, headers, signal: ctl.signal });
+    resp = await fetch(url, { ...init, headers, credentials: "same-origin", signal: ctl.signal });
   } catch (e) {
     if (ctl.signal.aborted) throw new ApiError(0, `timed out after ${Math.round(timeoutMs / 1000)}s`);
     throw new ApiError(0, e instanceof Error ? e.message : String(e));
@@ -43,7 +43,7 @@ async function requestText(url: string, timeoutMs = READ_TIMEOUT_MS): Promise<st
   const ctl = new AbortController();
   const timer = window.setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, { signal: ctl.signal });
+    const resp = await fetch(url, { credentials: "same-origin", signal: ctl.signal });
     const text = await resp.text();
     if (!resp.ok) throw new ApiError(resp.status, text || `${resp.status} ${resp.statusText}`);
     return text;

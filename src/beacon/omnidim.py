@@ -82,6 +82,6 @@ def _record(ok: bool, category: str = "") -> None:
     try:
         from beacon import health_log
 
-        health_log.record("omnidimension", ok, category)
+        health_log.record("omnidimension:session_creation", ok, category)
     except Exception:
         logger.debug("health_log failed", exc_info=True)

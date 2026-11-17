@@ -109,3 +109,22 @@ def test_python_package_has_no_aws_or_assemblyai_dependency():
         assert word not in text
     web = (ROOT / "web/package.json").read_text().lower()
     assert "aws" not in web and "assemblyai" not in web and "@omnidim-ai/client" in web and "bolna" not in web
+
+
+def test_correlator_manifest_is_least_privilege_and_wired():
+    docs = _docs("deploy/k8s/beacon/correlator.yaml")
+    dep = next(d for d in docs if d["kind"] == "Deployment")
+    pod = dep["spec"]["template"]["spec"]
+    c = pod["containers"][0]
+    assert c["command"] == ["python", "-m", "beacon.correlator"]
+    assert pod["automountServiceAccountToken"] is False and pod["securityContext"]["runAsNonRoot"] is True
+    assert {"startupProbe", "readinessProbe", "livenessProbe", "resources"} <= set(c)
+    assert c["securityContext"]["allowPrivilegeEscalation"] is False
+    assert not any("secretKeyRef" in str(e) for e in c.get("env", []))  # needs no secrets
+    env = next(d for d in _docs("deploy/k8s/beacon/beacon.yaml") if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "beacon-env")
+    assert env["data"]["CORRELATOR_URL"] == "http://beacon-correlator:9103"
+    assert any(d["kind"] == "Service" and d["metadata"]["name"] == "beacon-correlator" for d in docs)
+
+
+def test_pathway_is_a_pinned_dependency():
+    assert "pathway>=0.33.1,<0.34" in (ROOT / "pyproject.toml").read_text()

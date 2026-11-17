@@ -77,6 +77,7 @@ class NightShiftEvent(BaseModel):
     payload_reference: str = ""  # key into the retained, redacted source payload
     source_mode: SourceMode = SourceMode.LIVE
     trace_id: str = ""
+    run_id: str = ""  # demo-run generation; "" for LIVE events (joins only with other "")
     attributes: dict[str, str] = Field(default_factory=dict)  # safe labels only
 
     @property
@@ -99,6 +100,7 @@ class Correlation(BaseModel):
     window_start: str
     window_end: str
     window_seconds: int
+    run_id: str = ""
     strength: Literal["CHANGE_ONLY_NO_SYMPTOM", "PARTIAL", "STRONG"]
     explanation: str
     status: Literal["CORRELATION"] = "CORRELATION"  # never "confirmed root cause"
@@ -119,6 +121,14 @@ class ResearchItem(BaseModel):
     published_date: str | None = None
     updated_date: str | None = None
     retrieved_at: str
+    request_id: str | None = None  # Tavily request_id for the call that returned this source
+    credits: float | None = None  # usage.credits reported by Tavily for that call
+    domain: str = ""
+    content_hash: str = ""  # sha256 of the stored text (see hash_basis); detects materially changed sources
+    hash_basis: Literal["snippet", "extract"] = "snippet"  # snippet -> extract is enrichment, not a source change
+    published_at: str | None = None  # ISO form of published_date when it parsed; never guessed
+    date_status: Literal["KNOWN", "UNKNOWN", "UNPARSEABLE"] = "UNKNOWN"
+    planned_purpose: str = ""
     extraction_status: Literal["NOT_REQUESTED", "OK", "FAILED"] = "NOT_REQUESTED"
     classification: Literal[
         "SUPPORTS",
@@ -162,12 +172,64 @@ class ModelAnalysis(BaseModel):
     evidence_set_hash: str
     structured: StructuredAnalysis | None = None
     bifrost_request_id: str | None = None
+    bifrost_trace_id: str | None = None
+    upstream_latency_ms: float | None = None
+    fallback_index: int | None = None
     provider: str | None = None
     model: str | None = None
     latency_ms: int | None = None
     usage: dict[str, int] | None = None
     cost: float | None = None
     attempts: int | None = None
+    fallback_used: bool | None = None
+    status: Literal["OK", "DOWNGRADED", "GATEWAY_ERROR"] = "OK"
+    error_category: str | None = None
+    downgrade_reasons: list[str] = Field(default_factory=list)
+    created_at: str
+
+
+BRIEF_SCHEMA = "nightshift.research_brief.v2"
+
+
+class BriefFinding(BaseModel):
+    claim: str
+    kind: Literal["SOURCE_ESTABLISHED", "MODEL_INFERENCE", "HYPOTHESIS"]
+    evidence_ids: list[str] = Field(default_factory=list)
+    source_dates: list[str | None] = Field(default_factory=list)  # one per cited source; None = unknown
+
+
+class ResearchBrief(BaseModel):
+    """Bifrost-synthesised summary of the external sources, every finding tied to retrieved source ids."""
+
+    brief_id: str
+    incident_id: str
+    schema_version: str = BRIEF_SCHEMA
+    version: int = 1  # per-incident, monotonically increasing; older versions are never overwritten
+    previous_brief_id: str | None = None
+    snapshot_id: str = ""
+    evidence_strength: Literal["STRONG", "MODERATE", "WEAK", "INSUFFICIENT"] = "INSUFFICIENT"
+    evidence_strength_reason: str = ""
+    incident_summary: str = ""
+    likely_explanation: str = ""
+    structured_findings: list[BriefFinding] = Field(default_factory=list)
+    hypotheses: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    alternative_explanations: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    origin: Literal["BIFROST_MODEL", "RULES_ONLY"]
+    source_ids: list[str]  # the external evidence ids this brief was built from
+    source_set_hash: str
+    brief: str
+    findings: list[Claim] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    follow_up_queries: list[str] = Field(default_factory=list)  # sanitised; only run on explicit request
+    bifrost_request_id: str | None = None
+    bifrost_trace_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    latency_ms: int | None = None
+    usage: dict[str, int] | None = None
     fallback_used: bool | None = None
     status: Literal["OK", "DOWNGRADED", "GATEWAY_ERROR"] = "OK"
     error_category: str | None = None

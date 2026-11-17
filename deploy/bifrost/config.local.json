@@ -1,0 +1,16 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "client": { "enable_logging": true, "disable_content_logging": false, "allowed_origins": ["*"], "enforce_auth_on_inference": false },
+  "config_store": { "enabled": true, "type": "sqlite", "config": { "path": "./config.db" } },
+  "logs_store": { "enabled": true, "type": "sqlite", "config": { "path": "./logs.db" } },
+  "providers": {
+    "openai": {
+      "keys": [{ "name": "primary", "value": "sk-local-upstream", "weight": 1, "models": ["*"] }],
+      "network_config": { "base_url": "http://127.0.0.1:9300", "default_request_timeout_in_seconds": 20, "max_retries": 0 }
+    },
+    "groq": {
+      "keys": [{ "name": "fallback", "value": "gsk-local-upstream", "weight": 1, "models": ["*"] }],
+      "network_config": { "base_url": "http://127.0.0.1:9301", "default_request_timeout_in_seconds": 20, "max_retries": 0 }
+    }
+  }
+}

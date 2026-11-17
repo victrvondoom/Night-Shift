@@ -1,0 +1,52 @@
+# Pathway streaming correlator: NATS beacon.events -> beacon.correlations.
+# Same image as the API/worker (pathway is a pinned dependency in pyproject.toml); different command.
+# It needs NATS and nothing else: no Kubernetes API access, no database, no secrets.
+# NOT YET RUN on a cluster (the authoring environment had no Docker daemon / k3d); the manifest is
+# validated structurally by tests/test_manifests.py and the same entry point is exercised locally by
+# tests/test_workspace.py::test_pathway_* and `make demo-up`.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: beacon-correlator, namespace: beacon}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: beacon-correlator, namespace: beacon}
+spec:
+  replicas: 1          # one consumer: Pathway keeps correlation state in memory; scale-out would split it
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: beacon-correlator}}
+  template:
+    metadata: {labels: {app: beacon-correlator}}
+    spec:
+      serviceAccountName: beacon-correlator
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 20
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: correlator
+          image: beacon:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "beacon.correlator"]
+          envFrom:
+            - configMapRef: {name: beacon-env}
+            - configMapRef: {name: beacon-proxy, optional: true}
+          env:
+            - {name: CORRELATOR_PORT, value: "9103"}
+            - {name: CORRELATION_WINDOW_SECONDS, value: "600"}
+            - {name: HOME, value: /tmp}
+          ports: [{name: health, containerPort: 9103}]
+          startupProbe: {httpGet: {path: /healthz, port: health}, periodSeconds: 3, failureThreshold: 40}
+          readinessProbe: {httpGet: {path: /healthz, port: health}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /healthz, port: health}, periodSeconds: 20, failureThreshold: 3}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: beacon-correlator, namespace: beacon}
+spec:
+  selector: {app: beacon-correlator}
+  ports: [{name: health, port: 9103}]

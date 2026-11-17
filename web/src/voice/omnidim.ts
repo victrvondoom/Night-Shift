@@ -9,13 +9,11 @@
  *   authenticated action in the remediation panel.
  */
 import { WebSession } from "@omnidim-ai/client";
+import { applyTranscript, type TranscriptLine } from "./transcript";
+
+export { applyTranscript, type TranscriptLine };
 
 export type VoiceState = "NOT_CONFIGURED" | "idle" | "connecting" | "active" | "ended" | "error";
-export interface TranscriptLine {
-  role: "user" | "agent";
-  text: string;
-  final: boolean;
-}
 export interface VoiceSnapshot {
   state: VoiceState;
   muted: boolean;
@@ -24,20 +22,13 @@ export interface VoiceSnapshot {
   lines: TranscriptLine[];
 }
 
-/** Cumulative-snapshot reducer (exported for tests): replace the open line of the same role. */
-export function applyTranscript(lines: TranscriptLine[], ev: TranscriptLine): TranscriptLine[] {
-  const last = lines[lines.length - 1];
-  if (last && last.role === ev.role && !last.final) return [...lines.slice(0, -1), { ...ev }];
-  return [...lines, { ...ev }];
-}
-
 export class OmniVoice {
   private session: WebSession | null = null;
   private snap: VoiceSnapshot = { state: "idle", muted: false, lines: [] };
   private beaconSession = "";
   constructor(
     private voiceBase: string,
-    private passcode: () => string,
+    private csrf: () => string,
     private onChange: (s: VoiceSnapshot) => void,
   ) {}
 
@@ -47,7 +38,7 @@ export class OmniVoice {
   }
 
   private headers() {
-    return { "content-type": "application/json", "x-beacon-passcode": this.passcode() };
+    return { "content-type": "application/json", "x-csrf-token": this.csrf() };
   }
 
   private async post(path: string, body: unknown) {

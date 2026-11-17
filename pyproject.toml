@@ -18,7 +18,7 @@ dependencies = [
     "nats-py",
     "opentelemetry-exporter-otlp-proto-http",
     "opentelemetry-sdk",
-    "pathway>=0.33",
+    "pathway>=0.33.1,<0.34",
     "prometheus-client",
     "psycopg[binary]",
     "psycopg-pool",

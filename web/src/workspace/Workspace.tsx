@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OmniVoice, type VoiceSnapshot } from "../voice/omnidim";
+import { ResearchPanel } from "./ResearchPanel";
 import type { Analysis, Integration, Proposal, View } from "./types";
 
 /**
@@ -9,24 +10,27 @@ import type { Analysis, Integration, Proposal, View } from "./types";
 interface Props {
   base: string; // e.g. /api
   voiceBase: string; // e.g. /voice
-  passcode: string;
-  setPasscode: (v: string) => void;
   incidentId: string | null;
 }
 
 const fmt = (iso?: string | null) => (iso ? new Date(iso).toISOString().slice(11, 23) + "Z" : "—");
 
-async function call<T>(base: string, path: string, pass: string, method = "GET", body?: unknown): Promise<{ ok: boolean; status: number; data: T }> {
+async function call<T>(base: string, path: string, csrf: string, method = "GET", body?: unknown): Promise<{ ok: boolean; status: number; data: T }> {
   const r = await fetch(`${base}${path}`, {
     method,
-    headers: { "content-type": "application/json", "x-beacon-passcode": pass, "x-beacon-user": "console-engineer" },
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", ...(csrf ? { "x-csrf-token": csrf } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = (await r.json().catch(() => ({}))) as T;
   return { ok: r.ok, status: r.status, data };
 }
 
-export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }: Props) {
+export function Workspace({ base, voiceBase, incidentId }: Props) {
+  // Server-side session: HttpOnly cookie + CSRF token held in memory only (never in browser storage).
+  const [csrf, setCsrf] = useState("");
+  const [principal, setPrincipal] = useState<{ id: string; method: string } | null>(null);
+  const passcode = csrf; // truthy when signed in; the real credential is the cookie
   const [ids, setIds] = useState<{ incident_id: string; source_mode: string; detected_at: string }[]>([]);
   const [sel, setSel] = useState<string | null>(incidentId);
   const [view, setView] = useState<View | null>(null);
@@ -45,6 +49,7 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
 
   // incident list over SSE: a new incident appears without a reload
   useEffect(() => {
+    if (!csrf) return; // every workspace read needs the session
     const es = new EventSource(`${base}/ns/stream`);
     es.addEventListener("incidents", (e) => {
       const list = (JSON.parse((e as MessageEvent).data) as { incidents: typeof ids }).incidents;
@@ -52,11 +57,11 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
       setSel((cur) => (cur && list.some((i) => i.incident_id === cur) ? cur : list[0]?.incident_id ?? null));
     });
     return () => es.close();
-  }, [base]);
+  }, [base, csrf]);
 
   // selected incident over SSE
   useEffect(() => {
-    if (!sel) return;
+    if (!sel || !csrf) return;
     setView(null);
     setConn("connecting");
     const es = new EventSource(`${base}/ns/incidents/${sel}/stream`);
@@ -73,7 +78,7 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
       es.close();
       window.clearInterval(t);
     };
-  }, [base, sel]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [base, sel, csrf]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadIntegrations = useCallback(async () => {
     const r = await call<{ integrations: Integration[] }>(base, "/system/integrations", "");
@@ -85,11 +90,29 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
     return () => window.clearInterval(t);
   }, [loadIntegrations]);
 
+  const signIn = async (pc: string) => {
+    const r = await fetch(`${base}/auth/login`, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ passcode: pc }) });
+    const d = (await r.json().catch(() => ({}))) as { csrf_token?: string; principal?: string; method?: string; error?: string };
+    if (r.ok && d.csrf_token) {
+      setCsrf(d.csrf_token);
+      setPrincipal({ id: d.principal ?? "", method: d.method ?? "" });
+      setMsg(null);
+    } else setMsg({ kind: "err", text: `sign-in: ${d.error ?? `HTTP ${r.status}`}` });
+  };
+  useEffect(() => {
+    void fetch(`${base}/auth/me`, { credentials: "same-origin" }).then(async (r) => {
+      if (!r.ok) return;
+      const d = (await r.json()) as { csrf_token: string; principal: string; method: string };
+      setCsrf(d.csrf_token);
+      setPrincipal({ id: d.principal, method: d.method });
+    });
+  }, [base]);
+
   const act = async (label: string, path: string, body?: unknown) => {
-    if (!passcode) return setMsg({ kind: "err", text: "Unlock the console with the passcode first (Night Board → unlock)." });
+    if (!csrf) return setMsg({ kind: "err", text: "Sign in with the console passcode first." });
     setBusy(label);
     setMsg(null);
-    const r = await call<Record<string, unknown>>(base, path, passcode, "POST", body);
+    const r = await call<Record<string, unknown>>(base, path, csrf, "POST", body);
     setBusy("");
     const text = String(r.data.error || r.data.message || (r.ok ? "done" : `HTTP ${r.status}`));
     setMsg({ kind: r.ok ? "ok" : "err", text: `${label}: ${text}${r.data.detail ? ` (${r.data.detail})` : ""}` });
@@ -115,15 +138,16 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
           </select>
         </label>
         <span className={`ws-conn ${conn}`}>{stale ? "stale" : conn}</span>
+        {principal ? <span className="dim small" title="Derived server-side from the session. This is the passcode holder, not a verified individual.">signed in as {principal.id} ({principal.method})</span> : null}
         {passcode ? (
           <button disabled={!!busy} onClick={() => act("trigger", "/demo/trigger")}>
             Trigger NetworkPolicy incident (DEMO_SIMULATOR)
           </button>
         ) : (
-          <form className="ws-row" onSubmit={(e) => { e.preventDefault(); const v = String(new FormData(e.currentTarget).get("pc") || ""); if (v) setPasscode(v); }}>
+          <form className="ws-row" onSubmit={(e) => { e.preventDefault(); const v = String(new FormData(e.currentTarget).get("pc") || ""); if (v) void signIn(v); }}>
             <input name="pc" type="password" placeholder="console passcode" autoComplete="off" aria-label="console passcode" />
-            <button>Unlock</button>
-            <span className="dim">read-only until unlocked</span>
+            <button>Sign in</button>
+            <span className="dim">read-only until signed in</span>
           </form>
         )}
         <button className="ghost" disabled={!!busy || !passcode} onClick={() => act("reset", "/demo/reset")}>
@@ -132,7 +156,9 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
       </div>
       {msg ? <div className={`ws-msg ${msg.kind}`} role="status">{msg.text}</div> : null}
 
-      {!sel ? (
+      {!csrf ? (
+        <section className="ws-card"><h2>Sign in required</h2><p className="dim">Incident evidence, research and approvals are protected. Sign in with the console passcode above; it is exchanged for a server-side session and never stored in this browser.</p></section>
+      ) : !sel ? (
         <section className="ws-card">
           <h2>No incident yet</h2>
           <p className="dim">Nothing has been correlated. Trigger the scenario above, or run <code>make demo-trigger</code>. This page updates live when Pathway emits a correlation.</p>
@@ -145,11 +171,11 @@ export function Workspace({ base, voiceBase, passcode, setPasscode, incidentId }
           <Timeline v={view} />
           <Correlation v={view} />
           <div className="ws-grid">
-            <Research v={view} act={act} busy={busy} />
+            <ResearchPanel v={view} act={act} busy={busy} />
             <Explanation v={view} act={act} busy={busy} />
           </div>
-          <Voice v={view} voiceBase={voiceBase} passcode={passcode} />
-          <Remediation v={view} act={act} busy={busy} passcode={passcode} now={now} />
+          <Voice v={view} voiceBase={voiceBase} passcode={csrf} />
+          <Remediation v={view} act={act} busy={busy} passcode={csrf} now={now} />
           <Recovery v={view} base={base} />
         </>
       )}
@@ -162,7 +188,7 @@ function IntegrationStrip({ rows }: { rows: Integration[] }) {
     <section className="ws-int" aria-label="Integration health">
       {rows.length === 0 ? <span className="dim">integration health unavailable</span> : null}
       {rows.map((r) => (
-        <span key={r.integration} className={`chip st-${r.state}`} title={`${r.detail}${r.last_success_at ? ` · last ok ${r.last_success_at}` : ""}${r.last_error_category ? ` · last error ${r.last_error_category}` : ""}`}>
+        <span key={r.integration} className={`chip st-${r.state}`} title={`${r.detail}${r.last_success_at ? ` · last ok ${r.last_success_at}` : ""}${r.last_failure_at ? ` · last failure ${r.last_failure_at}` : ""}${r.last_error_category ? ` · ${r.last_error_category}` : ""}\n` + (r.capabilities ?? []).map((c) => `${c.capability}: ${c.state}${c.success_count || c.failure_count ? ` (${c.success_count} ok / ${c.failure_count} failed)` : ""}`).join("\n")}>
           <b>{r.integration}</b> {r.state}
           {r.mode !== "LIVE" ? <i> · {r.mode}</i> : null}
         </span>
@@ -240,25 +266,6 @@ function Correlation({ v }: { v: View }) {
 
 type Act = (label: string, path: string, body?: unknown) => Promise<{ ok: boolean; status: number; data: Record<string, unknown> } | void>;
 
-function Research({ v, act, busy }: { v: View; act: Act; busy: string }) {
-  return (
-    <section className="ws-card">
-      <h2>External research <span className="dim">Tavily</span></h2>
-      <button disabled={!!busy} onClick={() => act("research", `/ns/incidents/${v.incident_id}/research`)}>Research this incident</button>
-      {v.research.length === 0 ? <p className="dim">No sources retrieved. If Tavily shows NOT_CONFIGURED above, set TAVILY_API_KEY.</p> : null}
-      {v.research.map((r) => (
-        <article key={r.evidence_id} className="ws-src">
-          <div><span className={`badge cls-${r.classification}`}>{r.classification}</span> <a href={r.url} target="_blank" rel="noreferrer noopener">{r.title || r.url}</a></div>
-          <div className="dim small">query: “{r.query}” · retrieved {r.retrieved_at} · published {r.published_date ?? "unknown"} · updated {r.updated_date ?? "unknown"} · search score {r.score ?? "n/a"} (relevance, not confidence) · extract {r.extraction_status}</div>
-          <blockquote>{r.excerpt.slice(0, 400)}</blockquote>
-          <div className="small">Why: {r.classification_reason}</div>
-          <div className="mono small">{r.evidence_id}</div>
-        </article>
-      ))}
-    </section>
-  );
-}
-
 function Explanation({ v, act, busy }: { v: View; act: Act; busy: string }) {
   const a: Analysis | undefined = [...v.analyses].reverse().find((x) => x.structured) ?? v.analyses[v.analyses.length - 1];
   const s = a?.structured;
@@ -269,9 +276,10 @@ function Explanation({ v, act, busy }: { v: View; act: Act; busy: string }) {
       <button disabled={!!busy} onClick={() => act("analyze", `/ns/incidents/${v.incident_id}/analyze`)}>Explain with evidence</button>
       {!a ? <p className="dim">Not analysed yet.</p> : (
         <>
+          {a.staleness?.stale ? <div className="ws-msg err" role="alert"><b>STALE ANSWER.</b> {a.staleness.reason}. Re-run “Explain with evidence” before relying on it.</div> : null}
           <p><span className={`badge org-${a.origin}`}>{a.origin === "RULES_ONLY" ? "RULES_ONLY (not AI-generated)" : "AI via Bifrost"}</span> {a.status !== "OK" ? <span className="badge warn">{a.status}{a.error_category ? ` · ${a.error_category}` : ""}</span> : null}</p>
           {a.origin === "BIFROST_MODEL" ? (
-            <div className="dim small">request {a.bifrost_request_id ?? "id n/a"} · provider {a.provider ?? "n/a"} · model {a.model ?? "n/a"} · latency {a.latency_ms ?? "n/a"} ms · usage {a.usage ? JSON.stringify(a.usage) : "n/a"} · cost {a.cost ?? "n/a"} · evidence set {a.evidence_set_hash}</div>
+            <div className="dim small">Bifrost request {a.bifrost_request_id ?? "id n/a"} · trace {a.bifrost_trace_id ?? "n/a"} · fallback {a.fallback_used === null || a.fallback_used === undefined ? "n/a" : a.fallback_used ? `used (index ${a.fallback_index})` : "not used"} · provider {a.provider ?? "n/a"} · model {a.model ?? "n/a"} · latency {a.latency_ms ?? "n/a"} ms · usage {a.usage ? JSON.stringify(a.usage) : "n/a"} · cost {a.cost ?? "n/a"} · evidence set {a.evidence_set_hash}</div>
           ) : null}
           {a.downgrade_reasons.length ? <ul className="ws-list warn">{a.downgrade_reasons.map((d) => <li key={d}>{d}</li>)}</ul> : null}
           {s ? (

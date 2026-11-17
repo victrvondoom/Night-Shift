@@ -1,29 +1,71 @@
 {
-  "generated_at": "2026-11-16T17:56:46.235740+00:00",
+  "generated_at": "2026-11-17T06:53:43.177552+00:00",
   "results": [
     {
       "check": "ruff",
       "kind": "static",
-      "status": "PASS",
-      "detail": "All checks passed!"
+      "status": "FAIL",
+      "detail": "2 unsafe fixes available with `--fix --unsafe-fixes`."
     },
     {
-      "check": "pytest (unit, contract fakes, Pathway over NATS)",
-      "kind": "contract",
+      "check": "pytest: LIVE Tavily / Bifrost-provider / OmniDimension calls",
+      "kind": "live",
+      "status": "NOT_CONFIGURED",
+      "detail": "3 skipped in 0.67s"
+    },
+    {
+      "check": "pytest: unit + contract fakes + local NATS/Pathway/OPA/PG integration",
+      "kind": "contract+local",
       "status": "PASS",
-      "detail": "178 passed, 6 skipped in 26.29s"
+      "detail": "310 passed, 9 skipped in 122.48s (0:02:02)"
+    },
+    {
+      "check": "pytest: REAL Bifrost gateway process, LOCAL FAKE upstream model (not a live LLM)",
+      "kind": "live-gateway",
+      "status": "PASS",
+      "detail": "7 passed in 13.95s"
+    },
+    {
+      "check": "web unit tests (transcript semantics)",
+      "kind": "unit",
+      "status": "PASS",
+      "detail": "# duration_ms 125.767907"
     },
     {
       "check": "web typecheck + build",
       "kind": "static",
       "status": "PASS",
-      "detail": "\u2713 built in 1.38s"
+      "detail": "\u2713 built in 1.52s"
     },
     {
-      "check": "browser journey (DEMO_SIMULATOR)",
-      "kind": "e2e",
+      "check": "browser journey: REAL k3s control plane + real Prometheus/Alertmanager + EMULATED data plane (e2e/live_journey.mjs)",
+      "kind": "e2e-k3s",
       "status": "PASS",
-      "detail": "PASS  report generated from persisted data"
+      "detail": "PASS  14 real cluster state restored"
+    },
+    {
+      "check": "pytest: real k3s API server RBAC matrix, 403s, dry-run, optimistic concurrency, snapshot + context guards",
+      "kind": "live-k3s",
+      "status": "PASS",
+      "detail": "14 passed in 1.20s"
+    },
+    {
+      "check": "browser research journey (contract fake Tavily + real Bifrost gateway/fake upstream when running)",
+      "kind": "e2e",
+      "status": "FAIL",
+      "detail": "Node.js v22.23.4"
+    },
+    {
+      "check": "voice: real OmniDimension session, microphone, barge-in",
+      "kind": "live",
+      "status": "BLOCKED",
+      "detail": "needs OMNIDIM_API_KEY/OMNIDIM_AGENT_ID and a human with a microphone; manual procedure in docs/PHASE_IV.md"
+    },
+    {
+      "check": "execution mode",
+      "kind": "info",
+      "status": "PASS",
+      "detail": "temporal=TEMPORAL/CONNECTED kubernetes=REAL_CONTROL_PLANE+EMULATED_DATAPLANE/CONNECTED"
     },
     {
       "check": "live bifrost",
@@ -47,19 +89,19 @@
       "check": "service nats",
       "kind": "live",
       "status": "PASS",
-      "detail": "JetStream stream BEACON reachable"
+      "detail": "stream BEACON reachable"
     },
     {
       "check": "service pathway",
       "kind": "live",
       "status": "PASS",
-      "detail": "pathway 0.33.1 \u00b7 rule netpol_change_then_dependency_symptoms.v1 \u00b7 last event 2026-11-16T17:56:23.054959+00:00"
+      "detail": "34 correlation record(s) in the ledger"
     },
     {
       "check": "service opa",
       "kind": "live",
       "status": "PASS",
-      "detail": "policy engine /health"
+      "detail": "GET http://localhost:8281/health -> 200"
     },
     {
       "check": "service postgresql",

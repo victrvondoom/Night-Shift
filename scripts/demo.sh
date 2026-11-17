@@ -19,7 +19,22 @@ export LOG_SELECTORS='{namespace="demo"}' BEACON_K8S_IDENTITY=system:serviceacco
 export CORRELATOR_URL=http://127.0.0.1:9103 NIGHTSHIFT_API=http://127.0.0.1:8080 HEALTH_CHECK_ALLOW=localhost,127.0.0.1
 if [ "$MODE" = sim ]; then
   export SIMULATOR_URL=http://127.0.0.1:8090 PROMETHEUS_URL=http://127.0.0.1:8090/prom SANDBOX_CONTEXTS=demo-simulator
-  export REMEDIATION_MODE=inline VERIFY_WAIT_SECONDS=3 VERIFY_MAX_ATTEMPTS=6
+  export VERIFY_WAIT_SECONDS=3 VERIFY_MAX_ATTEMPTS=6
+fi
+# DEMO_EXEC=inline (default): remediation steps run in the worker process (INLINE_DEMO_ADAPTER, NOT Temporal)
+# DEMO_EXEC=temporal: a real Temporal dev server + worker execute RemediationWorkflow (TEMPORAL_LOCAL)
+EXEC=${DEMO_EXEC:-inline}
+if [ "$EXEC" = temporal ]; then
+  export REMEDIATION_MODE=temporal TEMPORAL_ADDRESS=127.0.0.1:7233
+else
+  export REMEDIATION_MODE=inline
+fi
+SBX=${SANDBOX_DIR:-/var/tmp/nightshift-sandbox}
+if [ "$MODE" = k3s ]; then
+  # REAL kube-apiserver/etcd/RBAC/audit (k3s) + real Prometheus/Alertmanager + the unmodified demo app.
+  # There is NO kubelet and no CNI: NetworkPolicy is enforced by beacon.sandbox.dataplane (EMULATED_DATAPLANE).
+  export K8S_FLAVOUR=k3s K8S_API_URL=https://127.0.0.1:6443 PROMETHEUS_URL=http://127.0.0.1:9090 SANDBOX_CONTEXTS=nightshift-sandbox REQUIRE_SANDBOX=true BEACON_K8S_CONTEXT=nightshift-sandbox
+  export VERIFY_WAIT_SECONDS=${VERIFY_WAIT_SECONDS:-6} VERIFY_MAX_ATTEMPTS=${VERIFY_MAX_ATTEMPTS:-12}
 fi
 API=http://127.0.0.1:8080
 UI=http://127.0.0.1:5173
@@ -36,7 +51,7 @@ start() {
   local name=$1
   shift
   alive "$name" && return 0
-  nohup "$@" >"$RUN/$name.log" 2>&1 &
+  setsid nohup "$@" >"$RUN/$name.log" 2>&1 </dev/null &
   echo $! >"$RUN/$name.pid"
 }
 stop_all() {
@@ -50,6 +65,13 @@ mode_now() { cat "$RUN/mode" 2>/dev/null || echo "$MODE"; }
 case "${1:-}" in
 up)
   bad=0
+  # Never let the printed mode disagree with the processes that are actually running.
+  if [ -s "$RUN/mode" ] && [ -s "$RUN/exec" ] && { alive api || alive worker; }; then
+    if [ "$(cat "$RUN/mode")" != "$MODE" ] || [ "$(cat "$RUN/exec")" != "$EXEC" ]; then
+      echo "REFUSED: demo already running as mode=$(cat "$RUN/mode") exec=$(cat "$RUN/exec"); run 'make demo-down' before switching to mode=$MODE exec=$EXEC" >&2
+      exit 1
+    fi
+  fi
   [ -x "$PY" ] || { echo "MISSING: $PY -- run 'make setup'" >&2; bad=1; }
   need node "install Node 20+" || bad=1
   up_port 5433 || { echo "MISSING: PostgreSQL on :5433 -- 'docker compose -f deploy/demo/docker-compose.yml up -d postgres' or start your own" >&2; bad=1; }
@@ -57,18 +79,30 @@ up)
   if ! up_port 8281; then need opa "install opa or use deploy/demo/docker-compose.yml" && start opa opa run --server --addr=0.0.0.0:8281 policy || bad=1; fi
   [ $bad = 0 ] || { echo "demo-up: prerequisites missing (see above)"; exit 1; }
   wait_http "http://127.0.0.1:8281/health" || exit 1
+  if [ "$EXEC" = temporal ]; then
+    up_port 7233 || { need temporal "install the Temporal CLI (temporal server start-dev)" && start temporal temporal server start-dev --headless --port 7233 --db-filename "$RUN/temporal.db" || exit 1; }
+    for _ in $(seq 1 60); do up_port 7233 && break; sleep 1; done
+    up_port 7233 || { echo "TIMEOUT waiting for Temporal on :7233" >&2; exit 1; }
+  fi
   [ "$MODE" = sim ] && start sim "$PY" -m beacon.sim.server
   start api .venv/bin/uvicorn beacon.server:app --port 8080
   wait_http "$API/healthz" || exit 1
   start correlator "$PY" -m beacon.correlator
-  start worker "$PY" -m beacon.worker
+  # only the worker holds cluster credentials (the restricted beacon-remediator ServiceAccount in k3s mode)
+  if [ "$MODE" = k3s ]; then KUBECONFIG="$SBX/remediator.yaml" start worker "$PY" -m beacon.worker; else start worker "$PY" -m beacon.worker; fi
   [ -d web/node_modules ] || (cd web && npm ci)
-  if ! alive web; then
-    (cd web && BEACON_API=$API nohup npx vite --host 127.0.0.1 --port 5173 >"../$RUN/web.log" 2>&1 & echo $! >"../$RUN/web.pid")
-  fi
+  BEACON_API=$API start web bash -c 'cd web && exec npx vite --host 127.0.0.1 --port 5173'
   wait_http "$UI/" && wait_http "http://127.0.0.1:9103/healthz" || exit 1
+  if [ "$MODE" = k3s ]; then
+    scripts/k3s_sandbox.sh up || exit 1
+    # the worker was started before the remediator kubeconfig existed on a first run: restart it with credentials
+    [ -s "$RUN/worker.pid" ] && kill "$(cat "$RUN/worker.pid")" 2>/dev/null; sleep 1
+    KUBECONFIG="$SBX/remediator.yaml" start worker "$PY" -m beacon.worker
+    scripts/sandbox_stack.sh up || exit 1
+  fi
   echo "$MODE" >"$RUN/mode"
-  echo "mode: $MODE"
+  echo "$EXEC" >"$RUN/exec"
+  echo "mode: $MODE$([ "$MODE" = k3s ] && echo " (REAL_CONTROL_PLANE + EMULATED_DATAPLANE)")   execution: $([ "$EXEC" = temporal ] && echo TEMPORAL_LOCAL || echo INLINE_DEMO_ADAPTER)"
   echo "UI:   $UI/#workspace   (console passcode: $PASSCODE)"
   echo "API:  $API"
   echo "optional credentials:"
@@ -80,26 +114,28 @@ status)
   curl -fsS "$API/api/system/integrations" | "$PY" -c "import sys,json;[print(f\"{r['integration']:<20} {r['state']:<22} {r['mode']:<15} {r['detail'][:70]}\") for r in json.load(sys.stdin)['integrations']]"
   ;;
 trigger)
-  if [ "$(mode_now)" = live ]; then
+  if [ "$(mode_now)" = k3s ]; then
+    scripts/k3s_sandbox.sh break && echo "REAL NetworkPolicy edit applied to the k3s control plane; the audit event, app errors and Prometheus alert follow" && sleep "${WAIT:-25}"
+    curl -fsS -H "x-beacon-passcode: $PASSCODE" "$API/api/ns/incidents" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['incidents'];print('incident_id:',d[0]['incident_id'] if d else 'none yet (still correlating)')"
+  elif [ "$(mode_now)" = live ]; then
     need kubectl "live mode needs a sandbox cluster (make cluster up)" || exit 1
     demo/trigger.sh break-netpol && echo "LIVE trigger sent; watch $UI/#workspace"
   else
     curl -fsS -XPOST -H "x-beacon-passcode: $PASSCODE" "$API/api/demo/trigger"
     echo
     sleep "${WAIT:-14}"
-    curl -fsS "$API/api/ns/incidents" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['incidents'];print('incident_id:',d[0]['incident_id'] if d else 'none yet (still correlating)')"
+    curl -fsS -H "x-beacon-passcode: $PASSCODE" "$API/api/ns/incidents" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['incidents'];print('incident_id:',d[0]['incident_id'] if d else 'none yet (still correlating)')"
   fi
   ;;
 reset)
+  if [ "$(mode_now)" = k3s ]; then scripts/k3s_sandbox.sh restore; exit $?; fi
   if [ "$(mode_now)" = live ]; then demo/trigger.sh restore; exit $?; fi
   curl -fsS -XPOST -H "x-beacon-passcode: $PASSCODE" "$API/api/demo/reset" # removes DEMO_SIMULATOR records only
   echo
-  [ -s "$RUN/correlator.pid" ] && kill "$(cat "$RUN/correlator.pid")" 2>/dev/null
-  sleep 1
-  start correlator "$PY" -m beacon.correlator
-  wait_http http://127.0.0.1:9103/healthz && echo "correlator restarted (clean Pathway state)"
+  # Pathway needs no restart: events are scoped by run_id, so an old run can never join a new one.
+  [ "${RESET_CORRELATOR:-0}" = 1 ] && { [ -s "$RUN/correlator.pid" ] && kill "$(cat "$RUN/correlator.pid")" 2>/dev/null; sleep 1; start correlator "$PY" -m beacon.correlator; wait_http http://127.0.0.1:9103/healthz && echo "correlator restarted (RESET_CORRELATOR=1)"; }
   ;;
 verify) "$PY" scripts/hackathon_verify.py ;;
-down) stop_all; echo stopped ;;
+down) stop_all; [ "$(mode_now)" = k3s ] && scripts/sandbox_stack.sh down; echo stopped ;;
 *) echo "usage: $0 up|status|trigger|reset|verify|down" >&2; exit 2 ;;
 esac

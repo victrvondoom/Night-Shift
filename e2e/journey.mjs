@@ -19,7 +19,7 @@ try {
   await page.goto(`${UI}/#workspace`);
   await page.waitForSelector(".ws");
   const navsAfterLoad = reloaded;
-  await page.fill('input[name="pc"]', PASS); await page.click('button:has-text("Unlock")');
+  await page.fill('input[name="pc"]', PASS); await page.click('button:has-text("Sign in")');
   const before = (await page.locator(".ws-head h1").first().innerText().catch(() => "")) || "";
   await page.click('button:has-text("Reset demo data")'); await page.waitForSelector(".ws-msg.ok");
   ok("integration strip rendered from backend", (await page.locator(".ws-int .chip").count()) >= 8);
@@ -50,8 +50,8 @@ try {
   ok("all three independent check groups PASS", checks === 3, `groups=${checks}`);
   await page.screenshot({ path: `${SHOTS}/2-verified.png`, fullPage: true });
   const href = await page.locator('a:has-text("Download report")').getAttribute("href");
-  const rep = await (await fetch(`${UI}${href}`)).text();
-  ok("report generated from persisted data", rep.includes("Recovery independently verified: True"));
+  const rep = await (await fetch(`${UI}${href}`, { headers: { "x-beacon-passcode": PASS } })).text();
+  ok("report generated from persisted data", rep.includes("Final state: **VERIFIED**") && rep.includes("Execution count: **1**"));
 } finally {
   fs.writeFileSync(`${SHOTS}/journey.json`, JSON.stringify({ steps }, null, 2));
   await browser.close();
