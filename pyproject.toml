@@ -36,7 +36,7 @@ dev = [
     "pytest-mock",
     "mypy",
     "types-PyYAML",
-    "ruff>=0.15",
+    "ruff>=0.17.5",
     "pre-commit",
 ]
 
